@@ -2451,14 +2451,26 @@ handle_button_press__Darkloard(XButtonEvent *event)
     } else if (event->button == Button2) {
         request_paste__Darkloard(XA_PRIMARY);
     } else if (event->button == Button4) {
-        scroll_offset += 3;
-        if (scroll_offset > history_count) {
-            scroll_offset = history_count;
+        if (in_alt_screen) {
+            for (int i = 0; i < 3; i++) {
+                write_pty__Darkloard(app_cursor_keys ? "\033OA" : "\033[A", 3);
+            }
+        } else {
+            scroll_offset += 3;
+            if (scroll_offset > history_count) {
+                scroll_offset = history_count;
+            }
         }
     } else if (event->button == Button5) {
-        scroll_offset -= 3;
-        if (scroll_offset < 0) {
-            scroll_offset = 0;
+        if (in_alt_screen) {
+            for (int i = 0; i < 3; i++) {
+                write_pty__Darkloard(app_cursor_keys ? "\033OB" : "\033[B", 3);
+            }
+        } else {
+            scroll_offset -= 3;
+            if (scroll_offset < 0) {
+                scroll_offset = 0;
+            }
         }
     }
 }
