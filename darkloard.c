@@ -136,6 +136,15 @@ struct DarkloardScreen
     bool is_dirty;
 };
 
+enum DarkloardFontVariant
+{
+    FONT_REGULAR = 0,
+    FONT_BOLD = 1,
+    FONT_ITALIC = 2,
+    FONT_BOLD_ITALIC = 3,
+    FONT_COUNT = 4,
+};
+
 enum DarkloardParseState
 {
     DARKLOARD_PARSE_STATE_NORMAL = 0,
@@ -193,10 +202,7 @@ static int pty_master_fd = -1;
 static struct DarkloardTerminal terminal = { 0 };
 static struct DarkloardTerminalProcess terminal_process = { 0 };
 static struct DarkloardMessageList message_list = { 0 };
-static XftFont *font = NULL;
-static XftFont *font_bold = NULL;
-static XftFont *font_italic = NULL;
-static XftFont *font_bold_italic = NULL;
+static XftFont *fonts[FONT_COUNT] = { 0 };
 static XftFont *font_cache[DARKLOARD_FONT_CACHE_SIZE] = { 0 };
 static int font_cache_len = 0;
 static unsigned int current_font_size = DARKLOARD_FONT_SIZE;
@@ -1871,19 +1877,9 @@ leave_alt_screen__Darkloard(bool restore_cursor)
 XftFont *
 get_font_for_codepoint__Darkloard(uint32_t cp, uint8_t attrs)
 {
-    bool bold = (attrs & DARKLOARD_ATTR_BOLD) != 0;
-    bool italic = (attrs & DARKLOARD_ATTR_ITALIC) != 0;
-
-    XftFont *base;
-    if (bold && italic) {
-        base = font_bold_italic ? font_bold_italic : font;
-    } else if (bold) {
-        base = font_bold ? font_bold : font;
-    } else if (italic) {
-        base = font_italic ? font_italic : font;
-    } else {
-        base = font;
-    }
+    int variant = ((attrs & DARKLOARD_ATTR_BOLD) ? 1 : 0) |
+                  ((attrs & DARKLOARD_ATTR_ITALIC) ? 2 : 0);
+    XftFont *base = fonts[variant] ? fonts[variant] : fonts[FONT_REGULAR];
 
     if (XftCharExists(display, base, cp)) {
         return base;
@@ -1909,12 +1905,12 @@ get_font_for_codepoint__Darkloard(uint32_t cp, uint8_t attrs)
     FcPatternDestroy(pat);
 
     if (!match) {
-        return font;
+        return fonts[FONT_REGULAR];
     }
 
     XftFont *fb = XftFontOpenPattern(display, match);
     if (!fb) {
-        return font;
+        return fonts[FONT_REGULAR];
     }
 
     if (font_cache_len < DARKLOARD_FONT_CACHE_SIZE) {
@@ -1993,7 +1989,7 @@ draw_glyph__Darkloard(XftDraw *draw,
                       int x,
                       int y)
 {
-    int baseline_y = y + font->ascent;
+    int baseline_y = y + fonts[FONT_REGULAR]->ascent;
 
     XftColor xft_color;
     XRenderColor xrc = { .red = (unsigned short)(((color >> 16) & 0xFF) * 257),
@@ -2027,7 +2023,7 @@ draw_glyph__Darkloard(XftDraw *draw,
                        back_buffer,
                        window_gc,
                        x,
-                       y + font->ascent / 2,
+                       y + fonts[FONT_REGULAR]->ascent / 2,
                        (unsigned int)cell_w,
                        1);
     }
@@ -2050,8 +2046,8 @@ draw__Darkloard(void)
                    back_buffer_height);
 
     XftDraw *draw = XftDrawCreate(display, back_buffer, visual, colormap);
-    int cell_w = font->max_advance_width;
-    int cell_h = font->ascent + font->descent;
+    int cell_w = fonts[FONT_REGULAR]->max_advance_width;
+    int cell_h = fonts[FONT_REGULAR]->ascent + fonts[FONT_REGULAR]->descent;
 
     for (uint32_t row = 0; row < screen.rows; row++) {
         struct DarkloardCell *row_cells = NULL;
@@ -2170,10 +2166,10 @@ handle_window_resize__Darkloard(unsigned short xpixel, unsigned short ypixel)
 
     unsigned short num_cols = (unsigned short)((xpixel - DARKLOARD_MARGIN_LEFT -
                                                 DARKLOARD_MARGIN_RIGHT) /
-                                               font->max_advance_width);
+                                               fonts[FONT_REGULAR]->max_advance_width);
     unsigned short num_rows = (unsigned short)((ypixel - DARKLOARD_MARGIN_TOP -
                                                 DARKLOARD_MARGIN_BOTTOM) /
-                                               (font->ascent + font->descent));
+                                               (fonts[FONT_REGULAR]->ascent + fonts[FONT_REGULAR]->descent));
 
     if (num_rows == 0 || num_cols == 0) {
         return;
@@ -2220,8 +2216,8 @@ deinit__DarkloardSelection(void)
 void
 pixel_to_cell__Darkloard(int px, int py, uint32_t *row, uint32_t *col)
 {
-    int cell_w = font->max_advance_width;
-    int cell_h = font->ascent + font->descent;
+    int cell_w = fonts[FONT_REGULAR]->max_advance_width;
+    int cell_h = fonts[FONT_REGULAR]->ascent + fonts[FONT_REGULAR]->descent;
     int r = (py - DARKLOARD_MARGIN_TOP) / cell_h;
     int c = (px - DARKLOARD_MARGIN_LEFT) / cell_w;
 
@@ -2719,29 +2715,16 @@ poll__Darkloard(void)
 static int
 load_font__Darkloard(void)
 {
+    static const char *suffixes[FONT_COUNT] = { "", ":bold", ":italic", ":bold:italic" };
     char *font_name = NULL;
 
-    XASPRINTF(&font_name, "%s:size=%d", DARKLOARD_FONT_NAME, DARKLOARD_FONT_SIZE);
-    font = XftFontOpenName(display, screen_num, font_name);
-    free(font_name);
-
-    if (!font) {
-        return 1;
+    for (int v = 0; v < FONT_COUNT; v++) {
+        XASPRINTF(&font_name, "%s:size=%d%s", DARKLOARD_FONT_NAME, DARKLOARD_FONT_SIZE, suffixes[v]);
+        fonts[v] = XftFontOpenName(display, screen_num, font_name);
+        free(font_name);
     }
 
-    XASPRINTF(&font_name, "%s:size=%d:bold", DARKLOARD_FONT_NAME, DARKLOARD_FONT_SIZE);
-    font_bold = XftFontOpenName(display, screen_num, font_name);
-    free(font_name);
-
-    XASPRINTF(&font_name, "%s:size=%d:italic", DARKLOARD_FONT_NAME, DARKLOARD_FONT_SIZE);
-    font_italic = XftFontOpenName(display, screen_num, font_name);
-    free(font_name);
-
-    XASPRINTF(&font_name, "%s:size=%d:bold:italic", DARKLOARD_FONT_NAME, DARKLOARD_FONT_SIZE);
-    font_bold_italic = XftFontOpenName(display, screen_num, font_name);
-    free(font_name);
-
-    return 0;
+    return fonts[FONT_REGULAR] ? 0 : 1;
 }
 
 void
@@ -2753,36 +2736,30 @@ reload_font__Darkloard(unsigned int new_size)
     }
     font_cache_len = 0;
 
-    XftFontClose(display, font);
-    font = NULL;
-    if (font_bold) { XftFontClose(display, font_bold); font_bold = NULL; }
-    if (font_italic) { XftFontClose(display, font_italic); font_italic = NULL; }
-    if (font_bold_italic) { XftFontClose(display, font_bold_italic); font_bold_italic = NULL; }
+    for (int v = 0; v < FONT_COUNT; v++) {
+        if (fonts[v]) { XftFontClose(display, fonts[v]); fonts[v] = NULL; }
+    }
 
+    static const char *suffixes[FONT_COUNT] = { "", ":bold", ":italic", ":bold:italic" };
     char *font_name = NULL;
+
     xasprintf__Darkloard(&font_name, "%s:size=%u", DARKLOARD_FONT_NAME, new_size);
-    font = XftFontOpenName(display, screen_num, font_name);
+    fonts[FONT_REGULAR] = XftFontOpenName(display, screen_num, font_name);
     free(font_name);
 
-    if (!font) {
+    if (!fonts[FONT_REGULAR]) {
         xasprintf__Darkloard(
           &font_name, "%s:size=%u", DARKLOARD_FONT_NAME, current_font_size);
-        font = XftFontOpenName(display, screen_num, font_name);
+        fonts[FONT_REGULAR] = XftFontOpenName(display, screen_num, font_name);
         free(font_name);
         return;
     }
 
-    xasprintf__Darkloard(&font_name, "%s:size=%u:bold", DARKLOARD_FONT_NAME, new_size);
-    font_bold = XftFontOpenName(display, screen_num, font_name);
-    free(font_name);
-
-    xasprintf__Darkloard(&font_name, "%s:size=%u:italic", DARKLOARD_FONT_NAME, new_size);
-    font_italic = XftFontOpenName(display, screen_num, font_name);
-    free(font_name);
-
-    xasprintf__Darkloard(&font_name, "%s:size=%u:bold:italic", DARKLOARD_FONT_NAME, new_size);
-    font_bold_italic = XftFontOpenName(display, screen_num, font_name);
-    free(font_name);
+    for (int v = FONT_BOLD; v < FONT_COUNT; v++) {
+        xasprintf__Darkloard(&font_name, "%s:size=%u%s", DARKLOARD_FONT_NAME, new_size, suffixes[v]);
+        fonts[v] = XftFontOpenName(display, screen_num, font_name);
+        free(font_name);
+    }
 
     current_font_size = new_size;
     handle_window_resize__Darkloard((unsigned short)window_width,
@@ -2797,10 +2774,9 @@ close__Darkloard(void)
     }
 
     font_cache_len = 0;
-    XftFontClose(display, font);
-    if (font_bold) XftFontClose(display, font_bold);
-    if (font_italic) XftFontClose(display, font_italic);
-    if (font_bold_italic) XftFontClose(display, font_bold_italic);
+    for (int v = 0; v < FONT_COUNT; v++) {
+        if (fonts[v]) { XftFontClose(display, fonts[v]); fonts[v] = NULL; }
+    }
 
     if (back_buffer) {
         XFreePixmap(display, back_buffer);
