@@ -199,6 +199,9 @@ static int font_cache_len = 0;
 static Pixmap back_buffer = 0;
 static unsigned int back_buffer_width = 0;
 static unsigned int back_buffer_height = 0;
+static struct DarkloardCell **inactive_cells = NULL;
+static struct DarkloardCursor main_cursor_saved = { 0 };
+static bool in_alt_screen = false;
 static struct DarkloardScreen screen = { 0 };
 static struct DarkloardParser parser = { 0 };
 static struct DarkloardSelection selection = { 0 };
@@ -300,6 +303,12 @@ feed__DarkloardParser(unsigned char c);
 
 static void
 parse__Darkloard(struct DarkloardMessage *message);
+
+static void
+enter_alt_screen__Darkloard(bool save_cursor);
+
+static void
+leave_alt_screen__Darkloard(bool restore_cursor);
 
 static XftFont *
 get_font_for_codepoint__Darkloard(uint32_t cp);
@@ -637,21 +646,41 @@ init__DarkloardScreen(uint32_t rows, uint32_t cols)
                                       .attrs = 0 };
         }
     }
+
+    in_alt_screen = false;
+    inactive_cells = XMALLOC(rows * sizeof(struct DarkloardCell *));
+
+    for (uint32_t i = 0; i < rows; i++) {
+        inactive_cells[i] = XMALLOC(cols * sizeof(struct DarkloardCell));
+
+        for (uint32_t j = 0; j < cols; j++) {
+            inactive_cells[i][j] =
+              (struct DarkloardCell){ .codepoint = ' ',
+                                      .fg = DARKLOARD_DEFAULT_FG,
+                                      .bg = DARKLOARD_DEFAULT_BG,
+                                      .attrs = 0 };
+        }
+    }
 }
 
 void
 deinit__DarkloardScreen(void)
 {
-    if (!screen.cells) {
-        return;
+    if (screen.cells) {
+        for (uint32_t i = 0; i < screen.rows; i++) {
+            free(screen.cells[i]);
+        }
+        free(screen.cells);
+        screen.cells = NULL;
     }
 
-    for (uint32_t i = 0; i < screen.rows; i++) {
-        free(screen.cells[i]);
+    if (inactive_cells) {
+        for (uint32_t i = 0; i < screen.rows; i++) {
+            free(inactive_cells[i]);
+        }
+        free(inactive_cells);
+        inactive_cells = NULL;
     }
-
-    free(screen.cells);
-    screen.cells = NULL;
 }
 
 void
@@ -1296,6 +1325,21 @@ handle_csi__DarkloardParser(void)
                     case 25:
                         screen.cursor.visible = set;
                         break;
+                    case 47:
+                    case 1047:
+                        if (set) {
+                            enter_alt_screen__Darkloard(false);
+                        } else {
+                            leave_alt_screen__Darkloard(false);
+                        }
+                        break;
+                    case 1049:
+                        if (set) {
+                            enter_alt_screen__Darkloard(true);
+                        } else {
+                            leave_alt_screen__Darkloard(true);
+                        }
+                        break;
                     default:
                         break;
                 }
@@ -1564,6 +1608,46 @@ parse__Darkloard(struct DarkloardMessage *message)
 {
     for (size_t i = 0; i < message->buffer_len; i++) {
         feed__DarkloardParser((unsigned char)message->buffer[i]);
+    }
+}
+
+void
+enter_alt_screen__Darkloard(bool save_cursor)
+{
+    if (in_alt_screen) {
+        return;
+    }
+
+    if (save_cursor) {
+        main_cursor_saved = screen.cursor;
+    }
+
+    struct DarkloardCell **tmp = screen.cells;
+    screen.cells = inactive_cells;
+    inactive_cells = tmp;
+
+    in_alt_screen = true;
+
+    screen.cursor.row = 0;
+    screen.cursor.col = 0;
+    erase_display__DarkloardScreen(2);
+}
+
+void
+leave_alt_screen__Darkloard(bool restore_cursor)
+{
+    if (!in_alt_screen) {
+        return;
+    }
+
+    struct DarkloardCell **tmp = screen.cells;
+    screen.cells = inactive_cells;
+    inactive_cells = tmp;
+
+    in_alt_screen = false;
+
+    if (restore_cursor) {
+        screen.cursor = main_cursor_saved;
     }
 }
 
