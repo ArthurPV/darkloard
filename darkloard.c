@@ -20,7 +20,6 @@
 
 #include "config.h"
 
-#define RGB(r, g, b) ((r) << 16 | (g) << 8 | (b))
 #define LOG_ERROR(fmt, ...) fprintf(stderr, "Error: " fmt "\n", ##__VA_ARGS__);
 #define XMALLOC(size) xmalloc__Darkloard(size)
 #define XASPRINTF(buffer, fmt, ...) \
@@ -57,8 +56,6 @@
 #define DARKLOARD_ATTR_INVISIBLE (1 << 6)
 #define DARKLOARD_ATTR_STRIKE (1 << 7)
 
-#define DARKLOARD_DEFAULT_FG RGB(255, 255, 255)
-#define DARKLOARD_DEFAULT_BG RGB(0, 0, 0)
 #define DARKLOARD_CSI_MAX_PARAMS 16
 #define DARKLOARD_TAB_WIDTH 8
 #define DARKLOARD_OSC_BUF_SIZE 1024
@@ -1209,12 +1206,10 @@ void
 handle_sgr__DarkloardParser(void)
 {
     static const uint32_t ansi_colors[16] = {
-        RGB(0, 0, 0),       RGB(187, 0, 0),     RGB(0, 187, 0),
-        RGB(187, 187, 0),   RGB(0, 0, 187),     RGB(187, 0, 187),
-        RGB(0, 187, 187),   RGB(187, 187, 187), RGB(85, 85, 85),
-        RGB(255, 85, 85),   RGB(85, 255, 85),   RGB(255, 255, 85),
-        RGB(85, 85, 255),   RGB(255, 85, 255),  RGB(85, 255, 255),
-        RGB(255, 255, 255),
+        DARKLOARD_COLOR_0,  DARKLOARD_COLOR_1,  DARKLOARD_COLOR_2,  DARKLOARD_COLOR_3,
+        DARKLOARD_COLOR_4,  DARKLOARD_COLOR_5,  DARKLOARD_COLOR_6,  DARKLOARD_COLOR_7,
+        DARKLOARD_COLOR_8,  DARKLOARD_COLOR_9,  DARKLOARD_COLOR_10, DARKLOARD_COLOR_11,
+        DARKLOARD_COLOR_12, DARKLOARD_COLOR_13, DARKLOARD_COLOR_14, DARKLOARD_COLOR_15,
     };
 
     int params_len = parser.csi.params_len == 0 ? 1 : parser.csi.params_len;
