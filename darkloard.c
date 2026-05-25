@@ -67,12 +67,6 @@
 #define DARKLOARD_FONT_CACHE_SIZE 64
 #define DARKLOARD_MAX_READ_BYTES (64 * 1024)
 
-// Every config value that can change during the terminal running.
-struct DarkloardConfig
-{
-    unsigned int font_size;
-};
-
 struct DarkloardTerminal
 {
     uint32_t row;
@@ -194,7 +188,6 @@ static int pty_master_fd = -1;
 static struct DarkloardTerminal terminal = { 0 };
 static struct DarkloardTerminalProcess terminal_process = { 0 };
 static struct DarkloardMessageList message_list = { 0 };
-static struct DarkloardConfig config = { 0 };
 static XftFont *font = NULL;
 static XftFont *font_cache[DARKLOARD_FONT_CACHE_SIZE] = { 0 };
 static int font_cache_len = 0;
