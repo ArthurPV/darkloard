@@ -197,6 +197,7 @@ static struct DarkloardConfig config = { 0 };
 static XftFont *font = NULL;
 static XftFont *font_cache[DARKLOARD_FONT_CACHE_SIZE] = { 0 };
 static int font_cache_len = 0;
+static unsigned int current_font_size = DARKLOARD_FONT_SIZE;
 static Pixmap back_buffer = 0;
 static unsigned int back_buffer_width = 0;
 static unsigned int back_buffer_height = 0;
@@ -367,6 +368,9 @@ poll__Darkloard(void);
 
 static int
 load_font__Darkloard(void);
+
+static void
+reload_font__Darkloard(unsigned int new_size);
 
 static void
 close__Darkloard(void);
@@ -2123,6 +2127,25 @@ handle_keypress__Darkloard(XKeyEvent *event)
         }
     }
 
+    if (event->state & ControlMask) {
+        if (keysym == XK_plus || keysym == XK_equal || keysym == XK_KP_Add) {
+            if (current_font_size < 72) {
+                reload_font__Darkloard(current_font_size + 1);
+            }
+            return;
+        }
+        if (keysym == XK_minus || keysym == XK_KP_Subtract) {
+            if (current_font_size > 4) {
+                reload_font__Darkloard(current_font_size - 1);
+            }
+            return;
+        }
+        if (keysym == XK_0 || keysym == XK_KP_0) {
+            reload_font__Darkloard(DARKLOARD_FONT_SIZE);
+            return;
+        }
+    }
+
     if (len > 0) {
         write_pty__Darkloard(buf, (size_t)len);
         return;
@@ -2297,6 +2320,36 @@ load_font__Darkloard(void)
     }
 
     return 0;
+}
+
+void
+reload_font__Darkloard(unsigned int new_size)
+{
+    for (int i = 0; i < font_cache_len; i++) {
+        XftFontClose(display, font_cache[i]);
+        font_cache[i] = NULL;
+    }
+    font_cache_len = 0;
+
+    XftFontClose(display, font);
+    font = NULL;
+
+    char *font_name = NULL;
+    xasprintf__Darkloard(&font_name, "%s:size=%u", DARKLOARD_FONT_NAME, new_size);
+    font = XftFontOpenName(display, screen_num, font_name);
+    free(font_name);
+
+    if (!font) {
+        xasprintf__Darkloard(
+          &font_name, "%s:size=%u", DARKLOARD_FONT_NAME, current_font_size);
+        font = XftFontOpenName(display, screen_num, font_name);
+        free(font_name);
+        return;
+    }
+
+    current_font_size = new_size;
+    handle_window_resize__Darkloard((unsigned short)window_width,
+                                    (unsigned short)window_height);
 }
 
 void
