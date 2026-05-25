@@ -1875,6 +1875,35 @@ draw__Darkloard(void)
                        cy,
                        (unsigned int)cell_w,
                        (unsigned int)cell_h);
+
+        if (screen.cursor.row < screen.rows && screen.cursor.col < screen.cols) {
+            struct DarkloardCell *cur_cell =
+              &screen.cells[screen.cursor.row][screen.cursor.col];
+            if (cur_cell->codepoint != 0 && cur_cell->codepoint != ' ') {
+                uint32_t inv = DARKLOARD_DEFAULT_BG;
+                XftColor xft_inv;
+                XRenderColor xrc_inv = {
+                    .red = (unsigned short)(((inv >> 16) & 0xFF) * 257),
+                    .green = (unsigned short)(((inv >> 8) & 0xFF) * 257),
+                    .blue = (unsigned short)(((inv) & 0xFF) * 257),
+                    .alpha = 0xFFFF
+                };
+                XftColorAllocValue(display, visual, colormap, &xrc_inv, &xft_inv);
+                char utf8[5] = { 0 };
+                int utf8_len =
+                  codepoint_to_utf8__Darkloard(cur_cell->codepoint, utf8);
+                XftFont *glyph_font =
+                  get_font_for_codepoint__Darkloard(cur_cell->codepoint);
+                XftDrawStringUtf8(draw,
+                                  &xft_inv,
+                                  glyph_font,
+                                  cx,
+                                  cy + font->ascent,
+                                  (FcChar8 *)utf8,
+                                  utf8_len);
+                XftColorFree(display, visual, colormap, &xft_inv);
+            }
+        }
     }
 
     XftDrawDestroy(draw);
