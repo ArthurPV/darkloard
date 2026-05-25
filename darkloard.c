@@ -1825,12 +1825,13 @@ handle_window_resize__Darkloard(unsigned short xpixel, unsigned short ypixel)
     if (back_buffer) {
         XFreePixmap(display, back_buffer);
     }
-    back_buffer = XCreatePixmap(display,
-                                window,
-                                xpixel,
-                                ypixel,
-                                (unsigned int)DefaultDepth(display, screen_num));
-    back_buffer_width  = xpixel;
+    back_buffer =
+      XCreatePixmap(display,
+                    window,
+                    xpixel,
+                    ypixel,
+                    (unsigned int)DefaultDepth(display, screen_num));
+    back_buffer_width = xpixel;
     back_buffer_height = ypixel;
 
     resize_pty__Darkloard(num_rows, num_cols, xpixel, ypixel);
@@ -2219,7 +2220,7 @@ handle_pty_events__Darkloard(void)
     size_t total = 0;
 
     while (is_terminal_alive__Darkloard()) {
-		// In case of command such as `yes`
+        // In case of command such as `yes`
         if (XPending(display)) {
             handle_x_events__Darkloard();
         }
@@ -2263,9 +2264,9 @@ poll__Darkloard(void)
         int ret = poll(fds, FDS_LEN, -1);
 
         if (ret > 0) {
-			if (fds[0].revents & POLLIN) {
-				handle_x_events__Darkloard();
-			}
+            if (fds[0].revents & POLLIN) {
+                handle_x_events__Darkloard();
+            }
 
             if (fds[1].revents & POLLIN) {
                 if (!handle_pty_events__Darkloard()) {
