@@ -3,4 +3,4 @@
 set -e
 set -o pipefail
 
-cc darkloard.c -lX11 -o darkloard
+cc -Wall darkloard.c -I/usr/include/freetype2 -lX11 -lXft -o darkloard

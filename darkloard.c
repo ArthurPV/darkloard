@@ -1,9 +1,12 @@
 #include <X11/Xlib.h>
+#include <X11/Xft/Xft.h>
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
 #include <string.h>
+#include <assert.h>
+#include <stdint.h>
 #include <pty.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -12,13 +15,69 @@
 
 #include <linux/limits.h>
 
+#include "config.h"
+
 #define RGB(r, g, b) ((r) << 16 | (g) << 8 | (b))
 #define LOG_ERROR(fmt, ...) fprintf(stderr, "Error: "fmt"\n", ##__VA_ARGS__);
 #define XMALLOC(size) xmalloc__Darkloard(size)
 
+// See:
+// - Linux: man console_codes
+#define DARKLOARD_BEL 0x07
+#define DARKLOARD_BS 0x08
+#define DARKLOARD_HT 0x09
+#define DARKLOARD_LF 0x0A
+#define DARKLOARD_VT 0x0B
+#define DARKLOARD_FF 0x0C
+#define DARKLOARD_CR 0x0D
+#define DARKLOARD_SO 0x0E
+#define DARKLOARD_SI 0x0F
+#define DARKLOARD_CAN 0x18
+#define DARKLOARD_SUB 0x1A
+#define DARKLOARD_ESC 0x1B
+#define DARKLOARD_DEL 0x7F
+#define DARKLOARD_CSI 0x9B
+
+#define DARKLOARD_NUL 0x00
+#define DARKLOARD_ENQ 0x05
+#define DARKLOARD_DC1 0x11
+#define DARKLOARD_DC3 0x13
+
+struct DarkloardConfig {
+	unsigned int font_size;
+	struct {
+		unsigned int top;
+		unsigned int bottom;
+		unsigned int left;
+		unsigned int right;
+	} margin;
+};
+
 struct DarkloardTerminal {
+	uint32_t row;
+	uint32_t col;
+};
+
+struct DarkloardTerminalProcess {
 	char *shell;
 	pid_t shell_pid;
+};
+
+struct DarkloardMessage {
+	char *buffer;
+	size_t buffer_len;
+	struct DarkloardMessage *next;
+};
+
+struct DarkloardMessageList {
+	struct DarkloardMessage *first;
+	struct DarkloardMessage *last;
+};
+
+struct DarkloardParseIterator {
+	char *buffer;
+	size_t buffer_len;
+	char *current;
 };
 
 static Display *display = NULL;
@@ -27,8 +86,29 @@ static int window_width = 0;
 static int window_height = 0;
 static Window window = 0;
 static GC window_gc = {0};
+static int screen = 0;
+static Colormap colormap = {0};
+static Visual *visual = NULL;
 static int pty_master_fd = -1; 
 static struct DarkloardTerminal terminal = {0};
+static struct DarkloardTerminalProcess terminal_process = {0};
+static struct DarkloardMessageList message_list = {0};
+static struct DarkloardConfig config = {0};
+static XftFont *font = NULL;
+
+static inline struct DarkloardMessage init__DarkloardMessage(char *buffer, size_t buffer_len);
+
+static inline void deinit__DarkloardMessage(struct DarkloardMessage *self);
+
+static void deinit__DarkloardMessageList(struct DarkloardMessageList *self);
+
+static inline struct DarkloardParseIterator init__DarkloardParseIterator(char *buffer, size_t buffer_len);
+
+static inline bool has_reach_end__DarkloardParseIterator(const struct DarkloardParseIterator *self);
+
+static unsigned char current__DarkloardParseIterator(const struct DarkloardParseIterator *self);
+
+static unsigned char next__DarkloardParseIterator(struct DarkloardParseIterator *self);
 
 static void *xmalloc__Darkloard(size_t size);
 
@@ -46,13 +126,81 @@ static int read_pty__Darkloard(char **read_buffer_ptr, size_t *nbytes_read);
 
 static int write_pty__Darkloard(char *buffer, size_t buffer_len);
 
+static void parse__Darkloard(struct DarkloardMessage *message);
+
+static void draw__Darkloard(void);
+
 static void handle_x_events__Darkloard(void);
 
 static bool handle_pty_events__Darkloard(void);
 
 static void poll__Darkloard(void);
 
+static int load_font__Darkloard(void);
+
 static void close__Darkloard(void);
+
+struct DarkloardMessage init__DarkloardMessage(char *buffer, size_t buffer_len)
+{
+	return (struct DarkloardMessage){
+		.buffer = buffer,
+		.buffer_len = buffer_len,
+		.next = NULL
+	};
+}
+
+void deinit__DarkloardMessage(struct DarkloardMessage *self)
+{
+	free(self->buffer);
+	free(self);
+}
+
+void deinit__DarkloardMessageList(struct DarkloardMessageList *self)
+{
+	struct DarkloardMessage *current = self->first;
+
+	while (current) {
+		struct DarkloardMessage *message_to_free = current;
+
+		current = current->next;
+
+		deinit__DarkloardMessage(message_to_free);
+	}
+
+	self->first = NULL;
+	self->last = NULL;
+}
+
+struct DarkloardParseIterator init__DarkloardParseIterator(char *buffer, size_t buffer_len)
+{
+	assert(buffer && "Buffer should non-null");
+	assert(buffer_len > 0 && "Buffer should be greater than 0");
+
+	return (struct DarkloardParseIterator){
+		.buffer = buffer,
+		.buffer_len = buffer_len,
+		.current = buffer
+	};
+}
+
+bool has_reach_end__DarkloardParseIterator(const struct DarkloardParseIterator *self)
+{
+	return self->current - self->buffer < self->buffer_len;
+}
+
+unsigned char current__DarkloardParseIterator(const struct DarkloardParseIterator *self)
+{
+	return *self->current;
+}
+
+unsigned char next__DarkloardParseIterator(struct DarkloardParseIterator *self)
+{
+	if (self->current - self->buffer < self->buffer_len) {
+		++self->current;
+	}
+
+	return *self->current;
+}
 
 void *xmalloc__Darkloard(size_t size)
 {
@@ -88,7 +236,7 @@ int configure_terminal__Darkloard(int slave_fd)
 
 bool is_terminal_alive__Darkloard(void)
 {
-	if (terminal.shell_pid == 0 || waitpid(terminal.shell_pid, NULL, WNOHANG) != 0) {
+	if (terminal_process.shell_pid == 0 || waitpid(terminal_process.shell_pid, NULL, WNOHANG) != 0) {
 		return false;
 	}
 
@@ -133,8 +281,8 @@ child_end:
 
 			return 1;
 		default:
-			terminal.shell_pid = pid;
-			terminal.shell = shell;
+			terminal_process.shell_pid = pid;
+			terminal_process.shell = shell;
 
 			return 0;
 	}
@@ -201,22 +349,28 @@ int resize_pty__Darkloard(unsigned short row, unsigned short col, unsigned short
 		return 1;
 	}
 
+	terminal.row = row;
+	terminal.col = col;
+
 	return 0;
 }
 
 int read_pty__Darkloard(char **read_buffer_ptr, size_t *nbytes_read)
 {
 	char *read_buffer = XMALLOC(BUFSIZ);
+
+	memset(read_buffer, 0, BUFSIZ);
+
 	ssize_t res = read(pty_master_fd, read_buffer, BUFSIZ - 1);
 
 	if (res == -1) {
 		*nbytes_read = 0;
 		*read_buffer_ptr = NULL;
 
+		free(read_buffer);
+
 		return 1;
 	}
-
-	read_buffer[res] = 0;
 
 	*read_buffer_ptr = read_buffer;
 	*nbytes_read = res;
@@ -235,15 +389,68 @@ int write_pty__Darkloard(char *buffer, size_t buffer_len)
 	return 0;
 }
 
-void close__Darkloard(void)
+void parse__Darkloard(struct DarkloardMessage *message)
 {
-	XFreeGC(display, window_gc);
-	XCloseDisplay(display);
-	close(pty_master_fd);
+	struct DarkloardParseIterator iterator = init__DarkloardParseIterator(message->buffer, message->buffer_len);
 
-	if (is_terminal_alive__Darkloard()) {
-		kill(terminal.shell_pid, SIGTERM);
+	while (has_reach_end__DarkloardParseIterator(&iterator)) {
+		switch (current__DarkloardParseIterator(&iterator)) {
+			case DARKLOARD_BEL:
+				// We ignore the bep because it's anoying.
+				break;
+			case DARKLOARD_BS:
+				break;
+			case DARKLOARD_HT:
+				break;
+			case DARKLOARD_LF:
+				break;
+			case DARKLOARD_VT:
+				break;
+			case DARKLOARD_FF:
+				break;
+			case DARKLOARD_CR:
+				break;
+			case DARKLOARD_SO:
+				break;
+			case DARKLOARD_SI:
+				break;
+			case DARKLOARD_CAN:
+				break;
+			case DARKLOARD_SUB:
+				break;
+			case DARKLOARD_ESC:
+				break;
+			case DARKLOARD_DEL:
+				break;
+			case DARKLOARD_CSI:
+				break;
+			case DARKLOARD_NUL:
+				break;
+			case DARKLOARD_ENQ:
+				break;
+			case DARKLOARD_DC1:
+				break;
+			case DARKLOARD_DC3:
+				break;
+			default:
+				break;
+		}
 	}
+}
+
+void draw__Darkloard(void)
+{
+	XClearWindow(display, window);
+	XSetForeground(display, window_gc, RGB(255, 255, 255));
+
+	XftDraw *draw = XftDrawCreate(display, window, visual, colormap);
+
+XftColor color;
+XRenderColor xrc = { .red = 0, .green = 0, .blue = 0xffff, .alpha = 0xffff };
+XftColorAllocValue(display, visual, colormap, &xrc, &color);
+
+XftDrawStringUtf8(draw, &color, font, 200, 200,
+                  (FcChar8 *)"Hello, World!", 13);
 }
 
 void handle_x_events__Darkloard(void)
@@ -256,6 +463,17 @@ void handle_x_events__Darkloard(void)
 		switch (event.type) {
 			case Expose:
 				break;
+			case ConfigureNotify: {
+				XConfigureEvent configure_event = event.xconfigure;
+				unsigned short xpixel = configure_event.width;
+				unsigned short ypixel = configure_event.height;
+				unsigned short row = xpixel / ();
+				unsigned short column = ypixel / (font->ascent + font->descent);
+
+				resize_pty__Darkloard(row, column, xpixel, ypixel);
+
+				break;
+			}
 			default:
 				break;
 		}
@@ -306,16 +524,49 @@ void poll__Darkloard(void)
 				}
 			}
 		}
+
+		draw__Darkloard();
 	}
 #undef FDS_LEN
+}
+
+static int load_font__Darkloard(void)
+{	
+	font = XftFontOpenName(display, screen, DARKLOARD_FONT_NAME":size="DARKLOARD_FONT_SIZE);
+
+	if (!font) {
+		return 1;
+	}
+
+	return 0;
+}
+
+void close__Darkloard(void)
+{
+	XftFontClose(display, font);
+	XFreeGC(display, window_gc);
+	XCloseDisplay(display);
+	close(pty_master_fd);
+
+	if (is_terminal_alive__Darkloard()) {
+		kill(terminal_process.shell_pid, SIGTERM);
+	}
+
+	deinit__DarkloardMessageList(&message_list);
 }
 
 int main() {
 	if (!(display = XOpenDisplay(NULL))) {
 		LOG_ERROR("failed to open display\n");
+
+		return 1;
 	}
 
 	display_fd = ConnectionNumber(display);
+
+	screen = DefaultScreen(display);
+	colormap = DefaultColormap(display, screen);
+	visual = DefaultVisual(display, screen);
 
 	Window window_root = XDefaultRootWindow(display);
 	XWindowAttributes window_root_attr;
@@ -324,13 +575,19 @@ int main() {
 		LOG_ERROR("unable to get window attributes\n");
 	}
 
+	if (load_font__Darkloard()) {
+		LOG_ERROR("failed to load font");
+
+		return 1;
+	}
+
 	window_width = window_root_attr.width;
 	window_height = window_root_attr.height;
 	window = XCreateSimpleWindow(display, window_root, 0, 0, window_width, window_height, 0, RGB(0, 0, 0), RGB(255, 255, 255));
 	window_gc = XCreateGC(display, window, 0, NULL);
 
 	XStoreName(display, window, "Darkloard");
-	XSelectInput(display, window, ExposureMask);
+	XSelectInput(display, window, ExposureMask | KeyPress | StructureNotifyMask);
 	XMapWindow(display, window);
 
 	open_pty__Darkloard();
