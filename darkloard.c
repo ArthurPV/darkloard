@@ -1604,9 +1604,8 @@ handle_osc__DarkloardParser(void)
     if (i < parser.osc_len && parser.osc_buf[i] == ';') {
         switch (cmd) {
             case 0:
-            case 1:
             case 2:
-                // Window title set — handled by the X11 layer in the future.
+                XStoreName(display, window, parser.osc_buf + i + 1);
                 break;
             default:
                 break;
