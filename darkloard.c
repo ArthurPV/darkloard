@@ -230,6 +230,7 @@ static Atom atom_clipboard = None;
 static Atom atom_targets = None;
 static Atom atom_xsel_data = None;
 static Atom atom_wm_delete = None;
+static Atom atom_net_wm_name = None;
 
 static inline struct DarkloardMessage
 init__DarkloardMessage(char *buffer, size_t buffer_len);
@@ -1746,9 +1747,20 @@ handle_osc__DarkloardParser(void)
     if (i < parser.osc_len && parser.osc_buf[i] == ';') {
         switch (cmd) {
             case 0:
-            case 2:
-                XStoreName(display, window, parser.osc_buf + i + 1);
+            case 2: {
+                const char *title = parser.osc_buf + i + 1;
+                int title_len = parser.osc_len - i - 1;
+                XStoreName(display, window, title);
+                XChangeProperty(display,
+                                window,
+                                atom_net_wm_name,
+                                atom_utf8_string,
+                                8,
+                                PropModeReplace,
+                                (const unsigned char *)title,
+                                title_len);
                 break;
+            }
             default:
                 break;
         }
@@ -2221,6 +2233,7 @@ init_atoms__Darkloard(void)
     atom_targets = XInternAtom(display, "TARGETS", False);
     atom_xsel_data = XInternAtom(display, "XSEL_DATA", False);
     atom_wm_delete = XInternAtom(display, "WM_DELETE_WINDOW", False);
+    atom_net_wm_name = XInternAtom(display, "_NET_WM_NAME", False);
 
     XSetWMProtocols(display, window, &atom_wm_delete, 1);
 }
