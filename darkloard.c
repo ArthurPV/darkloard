@@ -134,6 +134,8 @@ struct DarkloardScreen
     struct DarkloardCursor saved_cursor;
     bool saved_cursor_valid;
     bool is_dirty;
+    bool pending_wrap;
+    bool auto_wrap;
 };
 
 enum DarkloardFontVariant
@@ -712,6 +714,8 @@ init__DarkloardScreen(uint32_t rows, uint32_t cols)
     screen.scroll_region.top = 0;
     screen.scroll_region.bottom = rows - 1;
     screen.saved_cursor_valid = false;
+    screen.pending_wrap = false;
+    screen.auto_wrap = true;
 
     screen.cells = XMALLOC(rows * sizeof(struct DarkloardCell *));
 
@@ -891,18 +895,35 @@ put_char__DarkloardScreen(uint32_t codepoint)
         width = 1;
     }
 
-    if (width == 2 && screen.cursor.col + 1 >= screen.cols) {
-        screen.cells[screen.cursor.row][screen.cursor.col] =
-          (struct DarkloardCell){ .codepoint = ' ',
-                                  .fg = screen.current_fg,
-                                  .bg = screen.current_bg,
-                                  .attrs = screen.current_attrs };
+    /* Fire pending wrap before placing the character */
+    if (screen.pending_wrap && screen.auto_wrap) {
+        screen.pending_wrap = false;
         screen.cursor.col = 0;
         if (screen.cursor.row == screen.scroll_region.bottom) {
             scroll_up__DarkloardScreen(
               screen.scroll_region.top, screen.scroll_region.bottom, 1);
         } else if (screen.cursor.row < screen.rows - 1) {
             screen.cursor.row++;
+        }
+    } else {
+        screen.pending_wrap = false;
+    }
+
+    /* Wide char that doesn't fit: pad with space and wrap */
+    if (width == 2 && screen.cursor.col + 1 >= screen.cols) {
+        screen.cells[screen.cursor.row][screen.cursor.col] =
+          (struct DarkloardCell){ .codepoint = ' ',
+                                  .fg = screen.current_fg,
+                                  .bg = screen.current_bg,
+                                  .attrs = screen.current_attrs };
+        if (screen.auto_wrap) {
+            screen.cursor.col = 0;
+            if (screen.cursor.row == screen.scroll_region.bottom) {
+                scroll_up__DarkloardScreen(
+                  screen.scroll_region.top, screen.scroll_region.bottom, 1);
+            } else if (screen.cursor.row < screen.rows - 1) {
+                screen.cursor.row++;
+            }
         }
     }
 
@@ -923,12 +944,12 @@ put_char__DarkloardScreen(uint32_t codepoint)
     screen.cursor.col += (uint32_t)width;
 
     if (screen.cursor.col >= screen.cols) {
-        screen.cursor.col = 0;
-        if (screen.cursor.row == screen.scroll_region.bottom) {
-            scroll_up__DarkloardScreen(
-              screen.scroll_region.top, screen.scroll_region.bottom, 1);
-        } else if (screen.cursor.row < screen.rows - 1) {
-            screen.cursor.row++;
+        if (screen.auto_wrap) {
+            /* Defer the wrap; cursor stays at last column */
+            screen.cursor.col = screen.cols - 1;
+            screen.pending_wrap = true;
+        } else {
+            screen.cursor.col = screen.cols - 1;
         }
     }
 }
@@ -1057,6 +1078,7 @@ handle_normal__DarkloardParser(unsigned char c)
         case DARKLOARD_LF:
         case DARKLOARD_VT:
         case DARKLOARD_FF:
+            screen.pending_wrap = false;
             if (screen.cursor.row == screen.scroll_region.bottom) {
                 scroll_up__DarkloardScreen(
                   screen.scroll_region.top, screen.scroll_region.bottom, 1);
@@ -1065,6 +1087,7 @@ handle_normal__DarkloardParser(unsigned char c)
             }
             break;
         case DARKLOARD_CR:
+            screen.pending_wrap = false;
             screen.cursor.col = 0;
             break;
         case DARKLOARD_SO:
@@ -1133,10 +1156,13 @@ handle_esc__DarkloardParser(unsigned char c)
             break;
         case '8':
             if (screen.saved_cursor_valid) {
+                screen.pending_wrap = false;
                 screen.cursor = screen.saved_cursor;
             }
             break;
         case 'c':
+            screen.pending_wrap = false;
+            screen.auto_wrap = true;
             screen.cursor.row = 0;
             screen.cursor.col = 0;
             screen.current_fg = DARKLOARD_DEFAULT_FG;
@@ -1254,6 +1280,7 @@ handle_csi__DarkloardParser(void)
         case 'A': {
             int n = CSI_PARAM(0, 1);
             int new_row = (int)screen.cursor.row - n;
+            screen.pending_wrap = false;
             screen.cursor.row = new_row < (int)screen.scroll_region.top
                                   ? screen.scroll_region.top
                                   : (uint32_t)new_row;
@@ -1262,6 +1289,7 @@ handle_csi__DarkloardParser(void)
         case 'B': {
             int n = CSI_PARAM(0, 1);
             int new_row = (int)screen.cursor.row + n;
+            screen.pending_wrap = false;
             screen.cursor.row = new_row > (int)screen.scroll_region.bottom
                                   ? screen.scroll_region.bottom
                                   : (uint32_t)new_row;
@@ -1270,6 +1298,7 @@ handle_csi__DarkloardParser(void)
         case 'C': {
             int n = CSI_PARAM(0, 1);
             int new_col = (int)screen.cursor.col + n;
+            screen.pending_wrap = false;
             screen.cursor.col =
               new_col >= (int)screen.cols ? screen.cols - 1 : (uint32_t)new_col;
             break;
@@ -1277,12 +1306,14 @@ handle_csi__DarkloardParser(void)
         case 'D': {
             int n = CSI_PARAM(0, 1);
             int new_col = (int)screen.cursor.col - n;
+            screen.pending_wrap = false;
             screen.cursor.col = new_col < 0 ? 0 : (uint32_t)new_col;
             break;
         }
         case 'E': {
             int n = CSI_PARAM(0, 1);
             int new_row = (int)screen.cursor.row + n;
+            screen.pending_wrap = false;
             screen.cursor.row = new_row > (int)screen.scroll_region.bottom
                                   ? screen.scroll_region.bottom
                                   : (uint32_t)new_row;
@@ -1292,6 +1323,7 @@ handle_csi__DarkloardParser(void)
         case 'F': {
             int n = CSI_PARAM(0, 1);
             int new_row = (int)screen.cursor.row - n;
+            screen.pending_wrap = false;
             screen.cursor.row = new_row < (int)screen.scroll_region.top
                                   ? screen.scroll_region.top
                                   : (uint32_t)new_row;
@@ -1300,6 +1332,7 @@ handle_csi__DarkloardParser(void)
         }
         case 'G': {
             int col = CSI_PARAM(0, 1) - 1;
+            screen.pending_wrap = false;
             screen.cursor.col = (col < 0)                      ? 0
                                 : (uint32_t)col >= screen.cols ? screen.cols - 1
                                                                : (uint32_t)col;
@@ -1309,6 +1342,7 @@ handle_csi__DarkloardParser(void)
         case 'f': {
             int row = CSI_PARAM(0, 1) - 1;
             int col = CSI_PARAM(1, 1) - 1;
+            screen.pending_wrap = false;
             screen.cursor.row = (row < 0)                      ? 0
                                 : (uint32_t)row >= screen.rows ? screen.rows - 1
                                                                : (uint32_t)row;
@@ -1444,6 +1478,7 @@ handle_csi__DarkloardParser(void)
             break;
         case 'd': {
             int row = CSI_PARAM(0, 1) - 1;
+            screen.pending_wrap = false;
             screen.cursor.row = (row < 0)                      ? 0
                                 : (uint32_t)row >= screen.rows ? screen.rows - 1
                                                                : (uint32_t)row;
@@ -1474,6 +1509,7 @@ handle_csi__DarkloardParser(void)
                 screen.scroll_region.top = (uint32_t)(top - 1);
                 screen.scroll_region.bottom = (uint32_t)(bottom - 1);
             }
+            screen.pending_wrap = false;
             screen.cursor.row = 0;
             screen.cursor.col = 0;
             break;
@@ -1488,6 +1524,10 @@ handle_csi__DarkloardParser(void)
                         app_cursor_keys = set;
                         break;
                     case 7:
+                        screen.auto_wrap = set;
+                        if (!set) {
+                            screen.pending_wrap = false;
+                        }
                         break;
                     case 25:
                         screen.cursor.visible = set;
@@ -1532,6 +1572,7 @@ handle_csi__DarkloardParser(void)
             break;
         case 'u':
             if (screen.saved_cursor_valid) {
+                screen.pending_wrap = false;
                 screen.cursor = screen.saved_cursor;
             }
             break;
@@ -1879,6 +1920,7 @@ enter_alt_screen__Darkloard(bool save_cursor)
 
     in_alt_screen = true;
 
+    screen.pending_wrap = false;
     screen.cursor.row = 0;
     screen.cursor.col = 0;
     erase_display__DarkloardScreen(2);
@@ -1898,6 +1940,7 @@ leave_alt_screen__Darkloard(bool restore_cursor)
     in_alt_screen = false;
 
     if (restore_cursor) {
+        screen.pending_wrap = false;
         screen.cursor = main_cursor_saved;
         if (screen.cursor.row >= screen.rows) {
             screen.cursor.row = screen.rows > 0 ? screen.rows - 1 : 0;
