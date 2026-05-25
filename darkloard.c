@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 #include <X11/keysym.h>
 #include <X11/Xatom.h>
 #include <X11/Xft/Xft.h>
@@ -6,6 +8,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <locale.h>
 #include <poll.h>
 #include <pty.h>
 #include <stdarg.h>
@@ -16,6 +19,7 @@
 #include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <wchar.h>
 
 #include <linux/limits.h>
 
@@ -60,6 +64,7 @@
 #define DARKLOARD_CSI_MAX_PARAMS 16
 #define DARKLOARD_TAB_WIDTH 8
 #define DARKLOARD_OSC_BUF_SIZE 1024
+#define DARKLOARD_FONT_CACHE_SIZE 64
 
 // Every config value that can change during the terminal running.
 struct DarkloardConfig
@@ -158,6 +163,8 @@ struct DarkloardParser
     char osc_buf[DARKLOARD_OSC_BUF_SIZE];
     int osc_len;
     bool osc_esc_pending;
+    uint32_t utf8_codepoint;
+    int utf8_remaining;
 };
 
 struct DarkloardSelection
@@ -187,6 +194,8 @@ static struct DarkloardTerminalProcess terminal_process = { 0 };
 static struct DarkloardMessageList message_list = { 0 };
 static struct DarkloardConfig config = { 0 };
 static XftFont *font = NULL;
+static XftFont *font_cache[DARKLOARD_FONT_CACHE_SIZE] = { 0 };
+static int font_cache_len = 0;
 static struct DarkloardScreen    screen    = { 0 };
 static struct DarkloardParser    parser    = { 0 };
 static struct DarkloardSelection selection = { 0 };
@@ -288,6 +297,9 @@ feed__DarkloardParser(unsigned char c);
 
 static void
 parse__Darkloard(struct DarkloardMessage *message);
+
+static XftFont *
+get_font_for_codepoint__Darkloard(uint32_t cp);
 
 static void
 draw__Darkloard(void);
@@ -728,13 +740,41 @@ put_char__DarkloardScreen(uint32_t codepoint)
         return;
     }
 
+    int width = wcwidth((wchar_t)codepoint);
+    if (width < 0) {
+        width = 1;
+    }
+
+    if (width == 2 && screen.cursor.col + 1 >= screen.cols) {
+        screen.cells[screen.cursor.row][screen.cursor.col] =
+          (struct DarkloardCell){ .codepoint = ' ',
+                                  .fg = screen.current_fg,
+                                  .bg = screen.current_bg,
+                                  .attrs = screen.current_attrs };
+        screen.cursor.col = 0;
+        if (screen.cursor.row == screen.scroll_region.bottom) {
+            scroll_up__DarkloardScreen(
+              screen.scroll_region.top, screen.scroll_region.bottom, 1);
+        } else if (screen.cursor.row < screen.rows - 1) {
+            screen.cursor.row++;
+        }
+    }
+
     screen.cells[screen.cursor.row][screen.cursor.col] =
       (struct DarkloardCell){ .codepoint = codepoint,
                               .fg = screen.current_fg,
                               .bg = screen.current_bg,
                               .attrs = screen.current_attrs };
 
-    screen.cursor.col++;
+    if (width == 2 && screen.cursor.col + 1 < screen.cols) {
+        screen.cells[screen.cursor.row][screen.cursor.col + 1] =
+          (struct DarkloardCell){ .codepoint = 0,
+                                  .fg = screen.current_fg,
+                                  .bg = screen.current_bg,
+                                  .attrs = screen.current_attrs };
+    }
+
+    screen.cursor.col += (uint32_t)width;
 
     if (screen.cursor.col >= screen.cols) {
         screen.cursor.col = 0;
@@ -886,9 +926,11 @@ handle_normal__DarkloardParser(unsigned char c)
             break;
         case DARKLOARD_CAN:
         case DARKLOARD_SUB:
+            parser.utf8_remaining = 0;
             parser.state = DARKLOARD_PARSE_STATE_NORMAL;
             break;
         case DARKLOARD_ESC:
+            parser.utf8_remaining = 0;
             parser.state = DARKLOARD_PARSE_STATE_ESC;
             break;
         case DARKLOARD_DEL:
@@ -898,7 +940,26 @@ handle_normal__DarkloardParser(unsigned char c)
             parser.state = DARKLOARD_PARSE_STATE_CSI;
             break;
         default:
-            if (c >= 0x20) {
+            if (c >= 0xF0 && c <= 0xF4) {
+                parser.utf8_codepoint = c & 0x07;
+                parser.utf8_remaining = 3;
+            } else if (c >= 0xE0 && c <= 0xEF) {
+                parser.utf8_codepoint = c & 0x0F;
+                parser.utf8_remaining = 2;
+            } else if (c >= 0xC2 && c <= 0xDF) {
+                parser.utf8_codepoint = c & 0x1F;
+                parser.utf8_remaining = 1;
+            } else if (c >= 0x80 && c <= 0xBF) {
+                if (parser.utf8_remaining > 0) {
+                    parser.utf8_codepoint =
+                      (parser.utf8_codepoint << 6) | (c & 0x3F);
+                    parser.utf8_remaining--;
+                    if (parser.utf8_remaining == 0) {
+                        put_char__DarkloardScreen(parser.utf8_codepoint);
+                    }
+                }
+            } else if (c >= 0x20) {
+                parser.utf8_remaining = 0;
                 put_char__DarkloardScreen(c);
             }
             break;
@@ -1501,6 +1562,54 @@ parse__Darkloard(struct DarkloardMessage *message)
     }
 }
 
+XftFont *
+get_font_for_codepoint__Darkloard(uint32_t cp)
+{
+    if (XftCharExists(display, font, cp)) {
+        return font;
+    }
+
+    for (int i = 0; i < font_cache_len; i++) {
+        if (XftCharExists(display, font_cache[i], cp)) {
+            return font_cache[i];
+        }
+    }
+
+    FcPattern *pat = FcPatternCreate();
+    FcPatternAddDouble(pat, FC_SIZE, (double)DARKLOARD_FONT_SIZE);
+    FcCharSet *cs = FcCharSetCreate();
+    FcCharSetAddChar(cs, (FcChar32)cp);
+    FcPatternAddCharSet(pat, FC_CHARSET, cs);
+    FcCharSetDestroy(cs);
+    FcConfigSubstitute(NULL, pat, FcMatchPattern);
+    FcDefaultSubstitute(pat);
+
+    FcResult result;
+    FcPattern *match = FcFontMatch(NULL, pat, &result);
+    FcPatternDestroy(pat);
+
+    if (!match) {
+        return font;
+    }
+
+    XftFont *fb = XftFontOpenPattern(display, match);
+    if (!fb) {
+        return font;
+    }
+
+    if (font_cache_len < DARKLOARD_FONT_CACHE_SIZE) {
+        font_cache[font_cache_len++] = fb;
+    } else {
+        XftFontClose(display, font_cache[0]);
+        memmove(font_cache,
+                font_cache + 1,
+                (DARKLOARD_FONT_CACHE_SIZE - 1) * sizeof(XftFont *));
+        font_cache[DARKLOARD_FONT_CACHE_SIZE - 1] = fb;
+    }
+
+    return fb;
+}
+
 void
 draw__Darkloard(void)
 {
@@ -1559,9 +1668,11 @@ draw__Darkloard(void)
                 char utf8[5] = { 0 };
                 int utf8_len =
                   codepoint_to_utf8__Darkloard(cell->codepoint, utf8);
+                XftFont *glyph_font =
+                  get_font_for_codepoint__Darkloard(cell->codepoint);
                 XftDrawStringUtf8(draw,
                                   &xft_fg,
-                                  font,
+                                  glyph_font,
                                   x,
                                   y + font->ascent,
                                   (FcChar8 *)utf8,
@@ -2027,6 +2138,10 @@ load_font__Darkloard(void)
 void
 close__Darkloard(void)
 {
+    for (int i = 0; i < font_cache_len; i++) {
+        XftFontClose(display, font_cache[i]);
+    }
+    font_cache_len = 0;
     XftFontClose(display, font);
     XFreeGC(display, window_gc);
     XCloseDisplay(display);
@@ -2044,6 +2159,8 @@ close__Darkloard(void)
 int
 main()
 {
+    setlocale(LC_ALL, "");
+
     if (!(display = XOpenDisplay(NULL))) {
         LOG_ERROR("failed to open display\n");
 
