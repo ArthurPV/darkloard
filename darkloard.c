@@ -2198,12 +2198,14 @@ handle_window_resize__Darkloard(unsigned short xpixel, unsigned short ypixel)
     window_width = xpixel;
     window_height = ypixel;
 
-    unsigned short num_cols = (unsigned short)((xpixel - DARKLOARD_MARGIN_LEFT -
-                                                DARKLOARD_MARGIN_RIGHT) /
-                                               fonts[FONT_REGULAR]->max_advance_width);
+    unsigned short num_cols =
+      (unsigned short)((xpixel - DARKLOARD_MARGIN_LEFT -
+                        DARKLOARD_MARGIN_RIGHT) /
+                       fonts[FONT_REGULAR]->max_advance_width);
     unsigned short num_rows = (unsigned short)((ypixel - DARKLOARD_MARGIN_TOP -
                                                 DARKLOARD_MARGIN_BOTTOM) /
-                                               (fonts[FONT_REGULAR]->ascent + fonts[FONT_REGULAR]->descent));
+                                               (fonts[FONT_REGULAR]->ascent +
+                                                fonts[FONT_REGULAR]->descent));
 
     if (num_rows == 0 || num_cols == 0) {
         return;
@@ -2762,11 +2764,17 @@ poll__Darkloard(void)
 static int
 load_font__Darkloard(void)
 {
-    static const char *suffixes[FONT_COUNT] = { "", ":bold", ":italic", ":bold:italic" };
+    static const char *suffixes[FONT_COUNT] = {
+        "", ":bold", ":italic", ":bold:italic"
+    };
     char *font_name = NULL;
 
     for (int v = 0; v < FONT_COUNT; v++) {
-        XASPRINTF(&font_name, "%s:size=%d%s", DARKLOARD_FONT_NAME, DARKLOARD_FONT_SIZE, suffixes[v]);
+        XASPRINTF(&font_name,
+                  "%s:size=%d%s",
+                  DARKLOARD_FONT_NAME,
+                  DARKLOARD_FONT_SIZE,
+                  suffixes[v]);
         fonts[v] = XftFontOpenName(display, screen_num, font_name);
         free(font_name);
     }
@@ -2784,13 +2792,19 @@ reload_font__Darkloard(unsigned int new_size)
     font_cache_len = 0;
 
     for (int v = 0; v < FONT_COUNT; v++) {
-        if (fonts[v]) { XftFontClose(display, fonts[v]); fonts[v] = NULL; }
+        if (fonts[v]) {
+            XftFontClose(display, fonts[v]);
+            fonts[v] = NULL;
+        }
     }
 
-    static const char *suffixes[FONT_COUNT] = { "", ":bold", ":italic", ":bold:italic" };
+    static const char *suffixes[FONT_COUNT] = {
+        "", ":bold", ":italic", ":bold:italic"
+    };
     char *font_name = NULL;
 
-    xasprintf__Darkloard(&font_name, "%s:size=%u", DARKLOARD_FONT_NAME, new_size);
+    xasprintf__Darkloard(
+      &font_name, "%s:size=%u", DARKLOARD_FONT_NAME, new_size);
     fonts[FONT_REGULAR] = XftFontOpenName(display, screen_num, font_name);
     free(font_name);
 
@@ -2803,7 +2817,11 @@ reload_font__Darkloard(unsigned int new_size)
     }
 
     for (int v = FONT_BOLD; v < FONT_COUNT; v++) {
-        xasprintf__Darkloard(&font_name, "%s:size=%u%s", DARKLOARD_FONT_NAME, new_size, suffixes[v]);
+        xasprintf__Darkloard(&font_name,
+                             "%s:size=%u%s",
+                             DARKLOARD_FONT_NAME,
+                             new_size,
+                             suffixes[v]);
         fonts[v] = XftFontOpenName(display, screen_num, font_name);
         free(font_name);
     }
@@ -2822,7 +2840,10 @@ close__Darkloard(void)
 
     font_cache_len = 0;
     for (int v = 0; v < FONT_COUNT; v++) {
-        if (fonts[v]) { XftFontClose(display, fonts[v]); fonts[v] = NULL; }
+        if (fonts[v]) {
+            XftFontClose(display, fonts[v]);
+            fonts[v] = NULL;
+        }
     }
 
     if (back_buffer) {
