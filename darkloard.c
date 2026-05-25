@@ -1,9 +1,9 @@
 #define _GNU_SOURCE
 
-#include <X11/keysym.h>
 #include <X11/Xatom.h>
 #include <X11/Xft/Xft.h>
 #include <X11/Xlib.h>
+#include <X11/keysym.h>
 
 #include <assert.h>
 #include <errno.h>
@@ -169,14 +169,14 @@ struct DarkloardParser
 
 struct DarkloardSelection
 {
-    bool     active;
-    bool     selecting;
+    bool active;
+    bool selecting;
     uint32_t start_row;
     uint32_t start_col;
     uint32_t end_row;
     uint32_t end_col;
-    char    *text;
-    size_t   text_len;
+    char *text;
+    size_t text_len;
 };
 
 static Display *display = NULL;
@@ -196,14 +196,14 @@ static struct DarkloardConfig config = { 0 };
 static XftFont *font = NULL;
 static XftFont *font_cache[DARKLOARD_FONT_CACHE_SIZE] = { 0 };
 static int font_cache_len = 0;
-static struct DarkloardScreen    screen    = { 0 };
-static struct DarkloardParser    parser    = { 0 };
+static struct DarkloardScreen screen = { 0 };
+static struct DarkloardParser parser = { 0 };
 static struct DarkloardSelection selection = { 0 };
 
 static Atom atom_utf8_string = None;
-static Atom atom_clipboard   = None;
-static Atom atom_targets     = None;
-static Atom atom_xsel_data   = None;
+static Atom atom_clipboard = None;
+static Atom atom_targets = None;
+static Atom atom_xsel_data = None;
 
 static inline struct DarkloardMessage
 init__DarkloardMessage(char *buffer, size_t buffer_len);
@@ -1319,10 +1319,12 @@ void
 handle_sgr__DarkloardParser(void)
 {
     static const uint32_t ansi_colors[16] = {
-        DARKLOARD_COLOR_0,  DARKLOARD_COLOR_1,  DARKLOARD_COLOR_2,  DARKLOARD_COLOR_3,
-        DARKLOARD_COLOR_4,  DARKLOARD_COLOR_5,  DARKLOARD_COLOR_6,  DARKLOARD_COLOR_7,
-        DARKLOARD_COLOR_8,  DARKLOARD_COLOR_9,  DARKLOARD_COLOR_10, DARKLOARD_COLOR_11,
-        DARKLOARD_COLOR_12, DARKLOARD_COLOR_13, DARKLOARD_COLOR_14, DARKLOARD_COLOR_15,
+        DARKLOARD_COLOR_0,  DARKLOARD_COLOR_1,  DARKLOARD_COLOR_2,
+        DARKLOARD_COLOR_3,  DARKLOARD_COLOR_4,  DARKLOARD_COLOR_5,
+        DARKLOARD_COLOR_6,  DARKLOARD_COLOR_7,  DARKLOARD_COLOR_8,
+        DARKLOARD_COLOR_9,  DARKLOARD_COLOR_10, DARKLOARD_COLOR_11,
+        DARKLOARD_COLOR_12, DARKLOARD_COLOR_13, DARKLOARD_COLOR_14,
+        DARKLOARD_COLOR_15,
     };
 
     int params_len = parser.csi.params_len == 0 ? 1 : parser.csi.params_len;
@@ -1722,18 +1724,18 @@ void
 init_atoms__Darkloard(void)
 {
     atom_utf8_string = XInternAtom(display, "UTF8_STRING", False);
-    atom_clipboard   = XInternAtom(display, "CLIPBOARD",   False);
-    atom_targets     = XInternAtom(display, "TARGETS",     False);
-    atom_xsel_data   = XInternAtom(display, "XSEL_DATA",   False);
+    atom_clipboard = XInternAtom(display, "CLIPBOARD", False);
+    atom_targets = XInternAtom(display, "TARGETS", False);
+    atom_xsel_data = XInternAtom(display, "XSEL_DATA", False);
 }
 
 void
 deinit__DarkloardSelection(void)
 {
     free(selection.text);
-    selection.text      = NULL;
-    selection.text_len  = 0;
-    selection.active    = false;
+    selection.text = NULL;
+    selection.text_len = 0;
+    selection.active = false;
     selection.selecting = false;
 }
 
@@ -1742,11 +1744,15 @@ pixel_to_cell__Darkloard(int px, int py, uint32_t *row, uint32_t *col)
 {
     int cell_w = font->max_advance_width;
     int cell_h = font->ascent + font->descent;
-    int r = (py - DARKLOARD_MARGIN_TOP)  / cell_h;
+    int r = (py - DARKLOARD_MARGIN_TOP) / cell_h;
     int c = (px - DARKLOARD_MARGIN_LEFT) / cell_w;
 
-    *row = r < 0 ? 0 : (uint32_t)r >= screen.rows ? screen.rows - 1 : (uint32_t)r;
-    *col = c < 0 ? 0 : (uint32_t)c >= screen.cols ? screen.cols - 1 : (uint32_t)c;
+    *row = r < 0                        ? 0
+           : (uint32_t)r >= screen.rows ? screen.rows - 1
+                                        : (uint32_t)r;
+    *col = c < 0                        ? 0
+           : (uint32_t)c >= screen.cols ? screen.cols - 1
+                                        : (uint32_t)c;
 }
 
 bool
@@ -1757,11 +1763,15 @@ is_selected__DarkloardSelection(uint32_t row, uint32_t col)
     }
 
     uint32_t r1 = selection.start_row, c1 = selection.start_col;
-    uint32_t r2 = selection.end_row,   c2 = selection.end_col;
+    uint32_t r2 = selection.end_row, c2 = selection.end_col;
 
     if (r1 > r2 || (r1 == r2 && c1 > c2)) {
-        uint32_t tr = r1; r1 = r2; r2 = tr;
-        uint32_t tc = c1; c1 = c2; c2 = tc;
+        uint32_t tr = r1;
+        r1 = r2;
+        r2 = tr;
+        uint32_t tc = c1;
+        c1 = c2;
+        c2 = tc;
     }
 
     if (row < r1 || row > r2) {
@@ -1780,7 +1790,7 @@ void
 build_selection_text__DarkloardSelection(void)
 {
     free(selection.text);
-    selection.text     = NULL;
+    selection.text = NULL;
     selection.text_len = 0;
 
     if (!screen.cells) {
@@ -1788,11 +1798,15 @@ build_selection_text__DarkloardSelection(void)
     }
 
     uint32_t r1 = selection.start_row, c1 = selection.start_col;
-    uint32_t r2 = selection.end_row,   c2 = selection.end_col;
+    uint32_t r2 = selection.end_row, c2 = selection.end_col;
 
     if (r1 > r2 || (r1 == r2 && c1 > c2)) {
-        uint32_t tr = r1; r1 = r2; r2 = tr;
-        uint32_t tc = c1; c1 = c2; c2 = tc;
+        uint32_t tr = r1;
+        r1 = r2;
+        r2 = tr;
+        uint32_t tc = c1;
+        c1 = c2;
+        c2 = tc;
     }
 
     size_t max_size = (size_t)(r2 - r1 + 2) * ((size_t)screen.cols * 4 + 2);
@@ -1801,12 +1815,12 @@ build_selection_text__DarkloardSelection(void)
 
     for (uint32_t row = r1; row <= r2; row++) {
         uint32_t col_start = (row == r1) ? c1 : 0;
-        uint32_t col_end   = (row == r2) ? c2 : screen.cols - 1;
+        uint32_t col_end = (row == r2) ? c2 : screen.cols - 1;
 
         // Find last non-space in this row segment to strip trailing whitespace.
         uint32_t last = col_start;
         bool has_content = false;
-        for (uint32_t c = col_end + 1; c-- > col_start; ) {
+        for (uint32_t c = col_end + 1; c-- > col_start;) {
             uint32_t cp = screen.cells[row][c].codepoint;
             if (cp != 0 && cp != ' ') {
                 last = c;
@@ -1833,28 +1847,28 @@ build_selection_text__DarkloardSelection(void)
         }
     }
 
-    selection.text     = buf;
+    selection.text = buf;
     selection.text_len = len;
 }
 
 void
 request_paste__Darkloard(Atom sel_type)
 {
-    XConvertSelection(display, sel_type, atom_utf8_string,
-                      atom_xsel_data, window, CurrentTime);
+    XConvertSelection(
+      display, sel_type, atom_utf8_string, atom_xsel_data, window, CurrentTime);
 }
 
 void
 handle_selection_request__Darkloard(XSelectionRequestEvent *req)
 {
     XSelectionEvent notify = {
-        .type      = SelectionNotify,
-        .display   = req->display,
+        .type = SelectionNotify,
+        .display = req->display,
         .requestor = req->requestor,
         .selection = req->selection,
-        .target    = req->target,
-        .property  = None,
-        .time      = req->time,
+        .target = req->target,
+        .property = None,
+        .time = req->time,
     };
 
     if (!selection.text || selection.text_len == 0) {
@@ -1864,14 +1878,24 @@ handle_selection_request__Darkloard(XSelectionRequestEvent *req)
 
     if (req->target == atom_targets) {
         Atom supported[2] = { atom_utf8_string, XA_STRING };
-        XChangeProperty(req->display, req->requestor, req->property,
-                        XA_ATOM, 32, PropModeReplace,
-                        (unsigned char *)supported, 2);
+        XChangeProperty(req->display,
+                        req->requestor,
+                        req->property,
+                        XA_ATOM,
+                        32,
+                        PropModeReplace,
+                        (unsigned char *)supported,
+                        2);
         notify.property = req->property;
     } else if (req->target == atom_utf8_string || req->target == XA_STRING) {
-        XChangeProperty(req->display, req->requestor, req->property,
-                        req->target, 8, PropModeReplace,
-                        (unsigned char *)selection.text, (int)selection.text_len);
+        XChangeProperty(req->display,
+                        req->requestor,
+                        req->property,
+                        req->target,
+                        8,
+                        PropModeReplace,
+                        (unsigned char *)selection.text,
+                        (int)selection.text_len);
         notify.property = req->property;
     }
 
@@ -1890,10 +1914,18 @@ handle_selection_notify__Darkloard(XSelectionEvent *event)
     unsigned long nitems, bytes_after;
     unsigned char *data = NULL;
 
-    XGetWindowProperty(display, window, atom_xsel_data,
-                       0, 1024 * 1024L, True, AnyPropertyType,
-                       &actual_type, &actual_format,
-                       &nitems, &bytes_after, &data);
+    XGetWindowProperty(display,
+                       window,
+                       atom_xsel_data,
+                       0,
+                       1024 * 1024L,
+                       True,
+                       AnyPropertyType,
+                       &actual_type,
+                       &actual_format,
+                       &nitems,
+                       &bytes_after,
+                       &data);
 
     if (data && nitems > 0) {
         write_pty__Darkloard((char *)data, nitems);
@@ -1910,8 +1942,8 @@ handle_button_press__Darkloard(XButtonEvent *event)
     if (event->button == Button1) {
         deinit__DarkloardSelection();
         selection.selecting = true;
-        pixel_to_cell__Darkloard(event->x, event->y,
-                                  &selection.start_row, &selection.start_col);
+        pixel_to_cell__Darkloard(
+          event->x, event->y, &selection.start_row, &selection.start_col);
         selection.end_row = selection.start_row;
         selection.end_col = selection.start_col;
     } else if (event->button == Button2) {
@@ -1928,8 +1960,8 @@ handle_button_release__Darkloard(XButtonEvent *event)
 
     selection.selecting = false;
 
-    pixel_to_cell__Darkloard(event->x, event->y,
-                              &selection.end_row, &selection.end_col);
+    pixel_to_cell__Darkloard(
+      event->x, event->y, &selection.end_row, &selection.end_col);
 
     if (selection.start_row == selection.end_row &&
         selection.start_col == selection.end_col) {
@@ -1948,8 +1980,8 @@ handle_motion__Darkloard(XMotionEvent *event)
         return;
     }
 
-    pixel_to_cell__Darkloard(event->x, event->y,
-                              &selection.end_row, &selection.end_col);
+    pixel_to_cell__Darkloard(
+      event->x, event->y, &selection.end_row, &selection.end_col);
 }
 
 void
@@ -1962,7 +1994,8 @@ handle_keypress__Darkloard(XKeyEvent *event)
     if ((event->state & ControlMask) && (event->state & ShiftMask)) {
         if (keysym == XK_c || keysym == XK_C) {
             if (selection.active && selection.text_len > 0) {
-                XSetSelectionOwner(display, atom_clipboard, window, CurrentTime);
+                XSetSelectionOwner(
+                  display, atom_clipboard, window, CurrentTime);
             }
             return;
         }
