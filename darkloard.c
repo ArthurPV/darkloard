@@ -325,6 +325,13 @@ static XftFont *
 get_font_for_codepoint__Darkloard(uint32_t cp);
 
 static void
+draw_glyph__Darkloard(XftDraw *draw,
+                      uint32_t codepoint,
+                      uint32_t color,
+                      int x,
+                      int y);
+
+static void
 draw__Darkloard(void);
 
 static void
@@ -1763,6 +1770,29 @@ clear_history__Darkloard(void)
 }
 
 void
+draw_glyph__Darkloard(XftDraw *draw,
+                      uint32_t codepoint,
+                      uint32_t color,
+                      int x,
+                      int y)
+{
+    XftColor xft_color;
+    XRenderColor xrc = { .red = (unsigned short)(((color >> 16) & 0xFF) * 257),
+                         .green = (unsigned short)(((color >> 8) & 0xFF) * 257),
+                         .blue = (unsigned short)(((color) & 0xFF) * 257),
+                         .alpha = 0xFFFF };
+    XftColorAllocValue(display, visual, colormap, &xrc, &xft_color);
+
+    char utf8[5] = { 0 };
+    int utf8_len = codepoint_to_utf8__Darkloard(codepoint, utf8);
+    XftFont *glyph_font = get_font_for_codepoint__Darkloard(codepoint);
+    XftDrawStringUtf8(
+      draw, &xft_color, glyph_font, x, y, (FcChar8 *)utf8, utf8_len);
+
+    XftColorFree(display, visual, colormap, &xft_color);
+}
+
+void
 draw__Darkloard(void)
 {
     if (!screen.is_dirty || !screen.cells || !back_buffer) {
@@ -1837,29 +1867,8 @@ draw__Darkloard(void)
             }
 
             if (cell->codepoint != 0 && cell->codepoint != ' ') {
-                XftColor xft_fg;
-                XRenderColor xrc = {
-                    .red = (unsigned short)(((fg >> 16) & 0xFF) * 257),
-                    .green = (unsigned short)(((fg >> 8) & 0xFF) * 257),
-                    .blue = (unsigned short)(((fg) & 0xFF) * 257),
-                    .alpha = 0xFFFF
-                };
-                XftColorAllocValue(display, visual, colormap, &xrc, &xft_fg);
-
-                char utf8[5] = { 0 };
-                int utf8_len =
-                  codepoint_to_utf8__Darkloard(cell->codepoint, utf8);
-                XftFont *glyph_font =
-                  get_font_for_codepoint__Darkloard(cell->codepoint);
-                XftDrawStringUtf8(draw,
-                                  &xft_fg,
-                                  glyph_font,
-                                  x,
-                                  y + font->ascent,
-                                  (FcChar8 *)utf8,
-                                  utf8_len);
-
-                XftColorFree(display, visual, colormap, &xft_fg);
+                draw_glyph__Darkloard(
+                  draw, cell->codepoint, fg, x, y + font->ascent);
             }
         }
     }
@@ -1876,32 +1885,16 @@ draw__Darkloard(void)
                        (unsigned int)cell_w,
                        (unsigned int)cell_h);
 
-        if (screen.cursor.row < screen.rows && screen.cursor.col < screen.cols) {
+        if (screen.cursor.row < screen.rows &&
+            screen.cursor.col < screen.cols) {
             struct DarkloardCell *cur_cell =
               &screen.cells[screen.cursor.row][screen.cursor.col];
             if (cur_cell->codepoint != 0 && cur_cell->codepoint != ' ') {
-                uint32_t inv = DARKLOARD_DEFAULT_BG;
-                XftColor xft_inv;
-                XRenderColor xrc_inv = {
-                    .red = (unsigned short)(((inv >> 16) & 0xFF) * 257),
-                    .green = (unsigned short)(((inv >> 8) & 0xFF) * 257),
-                    .blue = (unsigned short)(((inv) & 0xFF) * 257),
-                    .alpha = 0xFFFF
-                };
-                XftColorAllocValue(display, visual, colormap, &xrc_inv, &xft_inv);
-                char utf8[5] = { 0 };
-                int utf8_len =
-                  codepoint_to_utf8__Darkloard(cur_cell->codepoint, utf8);
-                XftFont *glyph_font =
-                  get_font_for_codepoint__Darkloard(cur_cell->codepoint);
-                XftDrawStringUtf8(draw,
-                                  &xft_inv,
-                                  glyph_font,
-                                  cx,
-                                  cy + font->ascent,
-                                  (FcChar8 *)utf8,
-                                  utf8_len);
-                XftColorFree(display, visual, colormap, &xft_inv);
+                draw_glyph__Darkloard(draw,
+                                      cur_cell->codepoint,
+                                      DARKLOARD_DEFAULT_BG,
+                                      cx,
+                                      cy + font->ascent);
             }
         }
     }
