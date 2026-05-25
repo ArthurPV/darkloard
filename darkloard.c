@@ -772,9 +772,25 @@ deinit__DarkloardScreen(void)
 void
 resize__DarkloardScreen(uint32_t rows, uint32_t cols)
 {
+    bool was_in_alt = in_alt_screen;
     scroll_offset = 0;
+
+    if (!was_in_alt && screen.cells) {
+        for (uint32_t i = 0; i < screen.rows; i++) {
+            push_history_line__Darkloard(screen.cells[i], screen.cols);
+        }
+    }
+
     free_cells__DarkloardScreen();
     init__DarkloardScreen(rows, cols);
+    if (was_in_alt) {
+        struct DarkloardCell **tmp = screen.cells;
+        screen.cells = inactive_cells;
+        inactive_cells = tmp;
+        in_alt_screen = true;
+        screen.cursor.row = 0;
+        screen.cursor.col = 0;
+    }
 }
 
 void
@@ -1871,6 +1887,12 @@ leave_alt_screen__Darkloard(bool restore_cursor)
 
     if (restore_cursor) {
         screen.cursor = main_cursor_saved;
+        if (screen.cursor.row >= screen.rows) {
+            screen.cursor.row = screen.rows > 0 ? screen.rows - 1 : 0;
+        }
+        if (screen.cursor.col >= screen.cols) {
+            screen.cursor.col = screen.cols > 0 ? screen.cols - 1 : 0;
+        }
     }
 }
 
