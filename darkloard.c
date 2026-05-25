@@ -1519,13 +1519,13 @@ draw__Darkloard(void)
         int cx = DARKLOARD_MARGIN_LEFT + (int)screen.cursor.col * cell_w;
         int cy = DARKLOARD_MARGIN_TOP + (int)screen.cursor.row * cell_h;
         XSetForeground(display, window_gc, DARKLOARD_CURSOR_COLOR);
-        XDrawRectangle(display,
+        XFillRectangle(display,
                        window,
                        window_gc,
                        cx,
                        cy,
-                       (unsigned int)cell_w - 1,
-                       (unsigned int)cell_h - 1);
+                       (unsigned int)cell_w,
+                       (unsigned int)cell_h);
     }
 
     XftDrawDestroy(draw);
