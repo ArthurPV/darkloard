@@ -2485,11 +2485,14 @@ close__Darkloard(void)
     for (int i = 0; i < font_cache_len; i++) {
         XftFontClose(display, font_cache[i]);
     }
+
     font_cache_len = 0;
     XftFontClose(display, font);
+
     if (back_buffer) {
         XFreePixmap(display, back_buffer);
     }
+
     XFreeGC(display, window_gc);
     XCloseDisplay(display);
     close(pty_master_fd);
