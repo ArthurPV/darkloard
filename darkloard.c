@@ -196,6 +196,9 @@ static struct DarkloardConfig config = { 0 };
 static XftFont *font = NULL;
 static XftFont *font_cache[DARKLOARD_FONT_CACHE_SIZE] = { 0 };
 static int font_cache_len = 0;
+static Pixmap back_buffer = 0;
+static unsigned int back_buffer_width = 0;
+static unsigned int back_buffer_height = 0;
 static struct DarkloardScreen screen = { 0 };
 static struct DarkloardParser parser = { 0 };
 static struct DarkloardSelection selection = { 0 };
@@ -1615,13 +1618,20 @@ get_font_for_codepoint__Darkloard(uint32_t cp)
 void
 draw__Darkloard(void)
 {
-    if (!screen.cells) {
+    if (!screen.cells || !back_buffer) {
         return;
     }
 
-    XClearWindow(display, window);
+    XSetForeground(display, window_gc, DARKLOARD_DEFAULT_BG);
+    XFillRectangle(display,
+                   back_buffer,
+                   window_gc,
+                   0,
+                   0,
+                   back_buffer_width,
+                   back_buffer_height);
 
-    XftDraw *draw = XftDrawCreate(display, window, visual, colormap);
+    XftDraw *draw = XftDrawCreate(display, back_buffer, visual, colormap);
     int cell_w = font->max_advance_width;
     int cell_h = font->ascent + font->descent;
 
@@ -1649,7 +1659,7 @@ draw__Darkloard(void)
             if (bg != DARKLOARD_DEFAULT_BG) {
                 XSetForeground(display, window_gc, bg);
                 XFillRectangle(display,
-                               window,
+                               back_buffer,
                                window_gc,
                                x,
                                y,
@@ -1690,7 +1700,7 @@ draw__Darkloard(void)
         int cy = DARKLOARD_MARGIN_TOP + (int)screen.cursor.row * cell_h;
         XSetForeground(display, window_gc, DARKLOARD_CURSOR_COLOR);
         XFillRectangle(display,
-                       window,
+                       back_buffer,
                        window_gc,
                        cx,
                        cy,
@@ -1699,6 +1709,17 @@ draw__Darkloard(void)
     }
 
     XftDrawDestroy(draw);
+
+    XCopyArea(display,
+              back_buffer,
+              window,
+              window_gc,
+              0,
+              0,
+              back_buffer_width,
+              back_buffer_height,
+              0,
+              0);
     XFlush(display);
 }
 
@@ -1715,6 +1736,17 @@ handle_window_resize__Darkloard(unsigned short xpixel, unsigned short ypixel)
     if (num_rows == 0 || num_cols == 0) {
         return;
     }
+
+    if (back_buffer) {
+        XFreePixmap(display, back_buffer);
+    }
+    back_buffer = XCreatePixmap(display,
+                                window,
+                                xpixel,
+                                ypixel,
+                                (unsigned int)DefaultDepth(display, screen_num));
+    back_buffer_width  = xpixel;
+    back_buffer_height = ypixel;
 
     resize_pty__Darkloard(num_rows, num_cols, xpixel, ypixel);
     resize__DarkloardScreen(num_rows, num_cols);
@@ -2176,6 +2208,9 @@ close__Darkloard(void)
     }
     font_cache_len = 0;
     XftFontClose(display, font);
+    if (back_buffer) {
+        XFreePixmap(display, back_buffer);
+    }
     XFreeGC(display, window_gc);
     XCloseDisplay(display);
     close(pty_master_fd);
