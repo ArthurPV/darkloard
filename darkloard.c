@@ -142,6 +142,7 @@ enum DarkloardParseState
     DARKLOARD_PARSE_STATE_CSI,
     DARKLOARD_PARSE_STATE_OSC,
     DARKLOARD_PARSE_STATE_CHARSET,
+    DARKLOARD_PARSE_STATE_STR_SKIP,
 };
 
 struct DarkloardCsiParams
@@ -149,6 +150,8 @@ struct DarkloardCsiParams
     int params[DARKLOARD_CSI_MAX_PARAMS];
     int params_len;
     bool private_mode;
+    bool secondary;
+    char intermediate;
     char final_byte;
 };
 
@@ -159,6 +162,7 @@ struct DarkloardParser
     char osc_buf[DARKLOARD_OSC_BUF_SIZE];
     int osc_len;
     bool osc_esc_pending;
+    bool str_esc_pending;
     uint32_t utf8_codepoint;
     int utf8_remaining;
 };
@@ -206,6 +210,9 @@ static struct DarkloardScreen screen = { 0 };
 static struct DarkloardParser parser = { 0 };
 static struct DarkloardSelection selection = { 0 };
 static bool running = true;
+static bool app_cursor_keys = false;
+static bool bracketed_paste = false;
+static bool focus_events = false;
 
 static Atom atom_utf8_string = None;
 static Atom atom_clipboard = None;
@@ -299,6 +306,12 @@ handle_osc_byte__DarkloardParser(unsigned char c);
 
 static void
 handle_osc__DarkloardParser(void);
+
+static void
+handle_str_skip__DarkloardParser(unsigned char c);
+
+static uint32_t
+xterm256_to_rgb__Darkloard(int idx);
 
 static void
 feed__DarkloardParser(unsigned char c);
@@ -1096,6 +1109,13 @@ handle_esc__DarkloardParser(unsigned char c)
         case ')':
             parser.state = DARKLOARD_PARSE_STATE_CHARSET;
             break;
+        case 'P':
+        case '_':
+        case '^':
+        case 'X':
+            parser.str_esc_pending = false;
+            parser.state = DARKLOARD_PARSE_STATE_STR_SKIP;
+            break;
         case '=':
         case '>':
             break;
@@ -1112,7 +1132,13 @@ handle_csi_byte__DarkloardParser(unsigned char c)
         return;
     }
 
+    if (c == '>') {
+        parser.csi.secondary = true;
+        return;
+    }
+
     if (c >= 0x20 && c <= 0x2F) {
+        parser.csi.intermediate = (char)c;
         return;
     }
 
@@ -1315,6 +1341,39 @@ handle_csi__DarkloardParser(void)
             }
             break;
         }
+        case 'I': {
+            int n = CSI_PARAM(0, 1);
+            for (int j = 0; j < n; j++) {
+                uint32_t next_tab =
+                  (screen.cursor.col / DARKLOARD_TAB_WIDTH + 1) *
+                  DARKLOARD_TAB_WIDTH;
+                screen.cursor.col =
+                  next_tab >= screen.cols ? screen.cols - 1 : next_tab;
+                if (next_tab >= screen.cols) {
+                    break;
+                }
+            }
+            break;
+        }
+        case 'Z': {
+            int n = CSI_PARAM(0, 1);
+            for (int j = 0; j < n; j++) {
+                if (screen.cursor.col == 0) {
+                    break;
+                }
+                uint32_t prev_tab = (screen.cursor.col - 1) /
+                                    DARKLOARD_TAB_WIDTH * DARKLOARD_TAB_WIDTH;
+                screen.cursor.col = prev_tab;
+            }
+            break;
+        }
+        case 'c':
+            if (!parser.csi.secondary) {
+                write_pty__Darkloard("\033[?62;c", 7);
+            } else {
+                write_pty__Darkloard("\033[>1;10;0c", 10);
+            }
+            break;
         case 'd': {
             int row = CSI_PARAM(0, 1) - 1;
             screen.cursor.row = (row < 0)                      ? 0
@@ -1324,6 +1383,8 @@ handle_csi__DarkloardParser(void)
         }
         case 'm':
             handle_sgr__DarkloardParser();
+            break;
+        case 'q':
             break;
         case 'n': {
             int mode = parser.csi.params_len > 0 ? parser.csi.params[0] : 0;
@@ -1355,6 +1416,11 @@ handle_csi__DarkloardParser(void)
             if (parser.csi.private_mode) {
                 int mode = parser.csi.params_len > 0 ? parser.csi.params[0] : 0;
                 switch (mode) {
+                    case 1:
+                        app_cursor_keys = set;
+                        break;
+                    case 7:
+                        break;
                     case 25:
                         screen.cursor.visible = set;
                         break;
@@ -1366,12 +1432,25 @@ handle_csi__DarkloardParser(void)
                             leave_alt_screen__Darkloard(false);
                         }
                         break;
+                    case 1000:
+                    case 1001:
+                    case 1002:
+                    case 1003:
+                    case 1006:
+                    case 1015:
+                        break;
+                    case 1004:
+                        focus_events = set;
+                        break;
                     case 1049:
                         if (set) {
                             enter_alt_screen__Darkloard(true);
                         } else {
                             leave_alt_screen__Darkloard(true);
                         }
+                        break;
+                    case 2004:
+                        bracketed_paste = set;
                         break;
                     default:
                         break;
@@ -1476,10 +1555,8 @@ handle_sgr__DarkloardParser(void)
                 break;
             case 38:
                 if (i + 2 < params_len && parser.csi.params[i + 1] == 5) {
-                    int idx = parser.csi.params[i + 2];
-                    if (idx >= 0 && idx < 16) {
-                        screen.current_fg = ansi_colors[idx];
-                    }
+                    screen.current_fg =
+                      xterm256_to_rgb__Darkloard(parser.csi.params[i + 2]);
                     i += 2;
                 } else if (i + 4 < params_len &&
                            parser.csi.params[i + 1] == 2) {
@@ -1504,10 +1581,8 @@ handle_sgr__DarkloardParser(void)
                 break;
             case 48:
                 if (i + 2 < params_len && parser.csi.params[i + 1] == 5) {
-                    int idx = parser.csi.params[i + 2];
-                    if (idx >= 0 && idx < 16) {
-                        screen.current_bg = ansi_colors[idx];
-                    }
+                    screen.current_bg =
+                      xterm256_to_rgb__Darkloard(parser.csi.params[i + 2]);
                     i += 2;
                 } else if (i + 4 < params_len &&
                            parser.csi.params[i + 1] == 2) {
@@ -1614,6 +1689,66 @@ handle_osc__DarkloardParser(void)
 }
 
 void
+handle_str_skip__DarkloardParser(unsigned char c)
+{
+    if (c == DARKLOARD_ESC) {
+        parser.str_esc_pending = true;
+        return;
+    }
+
+    if (c == '\\' && parser.str_esc_pending) {
+        parser.str_esc_pending = false;
+        parser.state = DARKLOARD_PARSE_STATE_NORMAL;
+        return;
+    }
+
+    if (c == DARKLOARD_BEL || c == DARKLOARD_CAN || c == DARKLOARD_SUB) {
+        parser.str_esc_pending = false;
+        parser.state = DARKLOARD_PARSE_STATE_NORMAL;
+        return;
+    }
+
+    parser.str_esc_pending = false;
+}
+
+uint32_t
+xterm256_to_rgb__Darkloard(int idx)
+{
+    static const uint32_t base[16] = {
+        DARKLOARD_COLOR_0,  DARKLOARD_COLOR_1,  DARKLOARD_COLOR_2,
+        DARKLOARD_COLOR_3,  DARKLOARD_COLOR_4,  DARKLOARD_COLOR_5,
+        DARKLOARD_COLOR_6,  DARKLOARD_COLOR_7,  DARKLOARD_COLOR_8,
+        DARKLOARD_COLOR_9,  DARKLOARD_COLOR_10, DARKLOARD_COLOR_11,
+        DARKLOARD_COLOR_12, DARKLOARD_COLOR_13, DARKLOARD_COLOR_14,
+        DARKLOARD_COLOR_15,
+    };
+
+    if (idx < 0) {
+        return DARKLOARD_DEFAULT_FG;
+    }
+
+    if (idx < 16) {
+        return base[idx];
+    }
+
+    if (idx < 232) {
+        idx -= 16;
+        int r = idx / 36, g = (idx / 6) % 6, b = idx % 6;
+        int rv = r ? 55 + r * 40 : 0;
+        int gv = g ? 55 + g * 40 : 0;
+        int bv = b ? 55 + b * 40 : 0;
+        return RGB(rv, gv, bv);
+    }
+
+    if (idx < 256) {
+        int v = 8 + (idx - 232) * 10;
+        return RGB(v, v, v);
+    }
+
+    return DARKLOARD_DEFAULT_FG;
+}
+
+void
 feed__DarkloardParser(unsigned char c)
 {
     switch (parser.state) {
@@ -1631,6 +1766,9 @@ feed__DarkloardParser(unsigned char c)
             break;
         case DARKLOARD_PARSE_STATE_CHARSET:
             parser.state = DARKLOARD_PARSE_STATE_NORMAL;
+            break;
+        case DARKLOARD_PARSE_STATE_STR_SKIP:
+            handle_str_skip__DarkloardParser(c);
             break;
     }
 }
@@ -2157,7 +2295,13 @@ handle_selection_notify__Darkloard(XSelectionEvent *event)
                        &data);
 
     if (data && nitems > 0) {
+        if (bracketed_paste) {
+            write_pty__Darkloard("\033[200~", 6);
+        }
         write_pty__Darkloard((char *)data, nitems);
+        if (bracketed_paste) {
+            write_pty__Darkloard("\033[201~", 6);
+        }
     }
 
     if (data) {
@@ -2299,16 +2443,16 @@ handle_keypress__Darkloard(XKeyEvent *event)
             write_pty__Darkloard("\033[3~", 4);
             break;
         case XK_Up:
-            write_pty__Darkloard("\033[A", 3);
+            write_pty__Darkloard(app_cursor_keys ? "\033OA" : "\033[A", 3);
             break;
         case XK_Down:
-            write_pty__Darkloard("\033[B", 3);
+            write_pty__Darkloard(app_cursor_keys ? "\033OB" : "\033[B", 3);
             break;
         case XK_Right:
-            write_pty__Darkloard("\033[C", 3);
+            write_pty__Darkloard(app_cursor_keys ? "\033OC" : "\033[C", 3);
             break;
         case XK_Left:
-            write_pty__Darkloard("\033[D", 3);
+            write_pty__Darkloard(app_cursor_keys ? "\033OD" : "\033[D", 3);
             break;
         case XK_Home:
             write_pty__Darkloard("\033[H", 3);
@@ -2365,6 +2509,16 @@ handle_x_events__Darkloard(void)
                 break;
             case SelectionNotify:
                 handle_selection_notify__Darkloard(&event.xselection);
+                break;
+            case FocusIn:
+                if (focus_events) {
+                    write_pty__Darkloard("\033[I", 3);
+                }
+                break;
+            case FocusOut:
+                if (focus_events) {
+                    write_pty__Darkloard("\033[O", 3);
+                }
                 break;
             case SelectionClear:
                 deinit__DarkloardSelection();
@@ -2575,7 +2729,8 @@ main()
     XSelectInput(display,
                  window,
                  ExposureMask | KeyPressMask | StructureNotifyMask |
-                   ButtonPressMask | ButtonReleaseMask | Button1MotionMask);
+                   ButtonPressMask | ButtonReleaseMask | Button1MotionMask |
+                   FocusChangeMask);
     XMapWindow(display, window);
 
     init_atoms__Darkloard();
