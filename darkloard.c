@@ -66,7 +66,6 @@
 #define DARKLOARD_OSC_BUF_SIZE 1024
 #define DARKLOARD_FONT_CACHE_SIZE 64
 #define DARKLOARD_MAX_READ_BYTES (64 * 1024)
-#define DARKLOARD_HISTORY_LINES 2000
 
 // Every config value that can change during the terminal running.
 struct DarkloardConfig
@@ -2365,6 +2364,8 @@ handle_x_events__Darkloard(void)
                 break;
             }
             default:
+                screen.is_dirty = false;
+
                 break;
         }
     }

@@ -34,4 +34,6 @@
 #define DARKLOARD_COLOR_14 RGB(85, 255, 255)  // bright cyan
 #define DARKLOARD_COLOR_15 RGB(255, 255, 255) // bright white
 
+#define DARKLOARD_HISTORY_LINES 10000
+
 #endif // DARKLOARD_CONFIG_H
