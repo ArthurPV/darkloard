@@ -193,8 +193,8 @@ struct DarkloardSelection
 
 static Display *display = NULL;
 static int display_fd = -1;
-static int window_width = 0;
-static int window_height = 0;
+static unsigned int window_width = 0;
+static unsigned int window_height = 0;
 static Window window = 0;
 static GC window_gc = { 0 };
 static int screen_num = 0;
@@ -2924,11 +2924,6 @@ main()
     visual = DefaultVisual(display, screen_num);
 
     Window window_root = XDefaultRootWindow(display);
-    XWindowAttributes window_root_attr;
-
-    if (XGetWindowAttributes(display, window_root, &window_root_attr) == 0) {
-        LOG_ERROR("unable to get window attributes\n");
-    }
 
     if (load_font__Darkloard()) {
         LOG_ERROR("failed to load font");
@@ -2936,14 +2931,15 @@ main()
         return 1;
     }
 
-    window_width = window_root_attr.width;
-    window_height = window_root_attr.height;
+    // Default width and height
+    window_width = 900;
+    window_height = 500;
     window = XCreateSimpleWindow(display,
                                  window_root,
                                  0,
                                  0,
-                                 (unsigned int)window_width,
-                                 (unsigned int)window_height,
+                                 window_width,
+                                 window_height,
                                  0,
                                  RGB(0, 0, 0),
                                  RGB(0, 0, 0));
