@@ -65,6 +65,7 @@
 #define DARKLOARD_TAB_WIDTH 8
 #define DARKLOARD_OSC_BUF_SIZE 1024
 #define DARKLOARD_FONT_CACHE_SIZE 64
+#define DARKLOARD_MAX_READ_BYTES (64 * 1024)
 
 // Every config value that can change during the terminal running.
 struct DarkloardConfig
@@ -2215,7 +2216,14 @@ handle_x_events__Darkloard(void)
 bool
 handle_pty_events__Darkloard(void)
 {
+    size_t total = 0;
+
     while (is_terminal_alive__Darkloard()) {
+		// In case of command such as `yes`
+        if (XPending(display)) {
+            handle_x_events__Darkloard();
+        }
+
         char *read_buffer;
         size_t read_buffer_len;
 
@@ -2229,13 +2237,19 @@ handle_pty_events__Darkloard(void)
             return true;
         }
 
+        total += read_buffer_len;
+
         struct DarkloardMessage message =
           init__DarkloardMessage(read_buffer, read_buffer_len);
         parse__Darkloard(&message);
         free(read_buffer);
+
+        if (total >= DARKLOARD_MAX_READ_BYTES) {
+            break;
+        }
     }
 
-    return false;
+    return is_terminal_alive__Darkloard();
 }
 
 void
@@ -2249,9 +2263,9 @@ poll__Darkloard(void)
         int ret = poll(fds, FDS_LEN, -1);
 
         if (ret > 0) {
-            if (fds[0].revents & POLLIN) {
-                handle_x_events__Darkloard();
-            }
+			if (fds[0].revents & POLLIN) {
+				handle_x_events__Darkloard();
+			}
 
             if (fds[1].revents & POLLIN) {
                 if (!handle_pty_events__Darkloard()) {
