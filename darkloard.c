@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <sys/wait.h>
 #include <poll.h>
+#include <stdarg.h>
 
 #include <linux/limits.h>
 
@@ -20,6 +21,7 @@
 #define RGB(r, g, b) ((r) << 16 | (g) << 8 | (b))
 #define LOG_ERROR(fmt, ...) fprintf(stderr, "Error: "fmt"\n", ##__VA_ARGS__);
 #define XMALLOC(size) xmalloc__Darkloard(size)
+#define XASPRINTF(buffer, fmt, ...) xasprintf__Darkloard(buffer, fmt, ##__VA_ARGS__);
 
 // See:
 // - Linux: man console_codes
@@ -43,14 +45,9 @@
 #define DARKLOARD_DC1 0x11
 #define DARKLOARD_DC3 0x13
 
+// Every config value that can change during the terminal running.
 struct DarkloardConfig {
 	unsigned int font_size;
-	struct {
-		unsigned int top;
-		unsigned int bottom;
-		unsigned int left;
-		unsigned int right;
-	} margin;
 };
 
 struct DarkloardTerminal {
@@ -112,6 +109,8 @@ static unsigned char next__DarkloardParseIterator(struct DarkloardParseIterator 
 
 static void *xmalloc__Darkloard(size_t size);
 
+static void xasprintf__Darkloard(char **buffer, const char *fmt, ...);
+
 static int configure_terminal__Darkloard(int slave_fd);
 
 static bool is_terminal_alive__Darkloard(void);
@@ -129,6 +128,8 @@ static int write_pty__Darkloard(char *buffer, size_t buffer_len);
 static void parse__Darkloard(struct DarkloardMessage *message);
 
 static void draw__Darkloard(void);
+
+static void handle_window_resize__Darkloard(unsigned short xpixel, unsigned short ypixel);
 
 static void handle_x_events__Darkloard(void);
 
@@ -212,6 +213,22 @@ void *xmalloc__Darkloard(size_t size)
 	}
 
 	return ptr;
+}
+
+void xasprintf__Darkloard(char **buffer, const char *fmt, ...)
+{
+	va_list vl;
+
+	va_start(vl, fmt);
+
+	vasprintf(buffer, fmt, vl);
+
+	if (!buffer) {
+		LOG_ERROR("out of memory");
+		exit(1);
+	}
+
+	va_end(vl);
 }
 
 int configure_terminal__Darkloard(int slave_fd)
@@ -453,6 +470,15 @@ XftDrawStringUtf8(draw, &color, font, 200, 200,
                   (FcChar8 *)"Hello, World!", 13);
 }
 
+
+void handle_window_resize__Darkloard(unsigned short xpixel, unsigned short ypixel)
+{
+	unsigned short row = (xpixel - DARKLOARD_MARGIN_LEFT - DARKLOARD_MARGIN_RIGHT) / font->max_advance_width;
+	unsigned short column = (ypixel - DARKLOARD_MARGIN_TOP - DARKLOARD_MARGIN_BOTTOM) / (font->ascent + font->descent); 
+
+	resize_pty__Darkloard(row, column, xpixel, ypixel);
+}
+
 void handle_x_events__Darkloard(void)
 {
 	while (XPending(display)) {
@@ -465,14 +491,8 @@ void handle_x_events__Darkloard(void)
 				break;
 			case ConfigureNotify: {
 				XConfigureEvent configure_event = event.xconfigure;
-				unsigned short xpixel = configure_event.width;
-				unsigned short ypixel = configure_event.height;
-				unsigned short row = xpixel / ();
-				unsigned short column = ypixel / (font->ascent + font->descent);
 
-				resize_pty__Darkloard(row, column, xpixel, ypixel);
-
-				break;
+				handle_window_resize__Darkloard(configure_event.width, configure_event.height);
 			}
 			default:
 				break;
@@ -532,7 +552,13 @@ void poll__Darkloard(void)
 
 static int load_font__Darkloard(void)
 {	
-	font = XftFontOpenName(display, screen, DARKLOARD_FONT_NAME":size="DARKLOARD_FONT_SIZE);
+	char *font_name = NULL;
+
+	XASPRINTF(&font_name, "%s:size=%d", DARKLOARD_FONT_NAME, DARKLOARD_FONT_SIZE);
+
+	font = XftFontOpenName(display, screen, font_name);
+
+	free(font_name);
 
 	if (!font) {
 		return 1;
@@ -591,6 +617,7 @@ int main() {
 	XMapWindow(display, window);
 
 	open_pty__Darkloard();
+	handle_window_resize__Darkloard(window_width, window_height);
 	handle_x_events__Darkloard();
 	poll__Darkloard();
 	close__Darkloard();
