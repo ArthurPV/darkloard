@@ -194,6 +194,9 @@ static struct DarkloardTerminal terminal = { 0 };
 static struct DarkloardTerminalProcess terminal_process = { 0 };
 static struct DarkloardMessageList message_list = { 0 };
 static XftFont *font = NULL;
+static XftFont *font_bold = NULL;
+static XftFont *font_italic = NULL;
+static XftFont *font_bold_italic = NULL;
 static XftFont *font_cache[DARKLOARD_FONT_CACHE_SIZE] = { 0 };
 static int font_cache_len = 0;
 static unsigned int current_font_size = DARKLOARD_FONT_SIZE;
@@ -340,12 +343,14 @@ static void
 leave_alt_screen__Darkloard(bool restore_cursor);
 
 static XftFont *
-get_font_for_codepoint__Darkloard(uint32_t cp);
+get_font_for_codepoint__Darkloard(uint32_t cp, uint8_t attrs);
 
 static void
 draw_glyph__Darkloard(XftDraw *draw,
                       uint32_t codepoint,
                       uint32_t color,
+                      uint8_t attrs,
+                      int cell_w,
                       int x,
                       int y);
 
@@ -1864,10 +1869,24 @@ leave_alt_screen__Darkloard(bool restore_cursor)
 }
 
 XftFont *
-get_font_for_codepoint__Darkloard(uint32_t cp)
+get_font_for_codepoint__Darkloard(uint32_t cp, uint8_t attrs)
 {
-    if (XftCharExists(display, font, cp)) {
-        return font;
+    bool bold = (attrs & DARKLOARD_ATTR_BOLD) != 0;
+    bool italic = (attrs & DARKLOARD_ATTR_ITALIC) != 0;
+
+    XftFont *base;
+    if (bold && italic) {
+        base = font_bold_italic ? font_bold_italic : font;
+    } else if (bold) {
+        base = font_bold ? font_bold : font;
+    } else if (italic) {
+        base = font_italic ? font_italic : font;
+    } else {
+        base = font;
+    }
+
+    if (XftCharExists(display, base, cp)) {
+        return base;
     }
 
     for (int i = 0; i < font_cache_len; i++) {
@@ -1969,9 +1988,13 @@ void
 draw_glyph__Darkloard(XftDraw *draw,
                       uint32_t codepoint,
                       uint32_t color,
+                      uint8_t attrs,
+                      int cell_w,
                       int x,
                       int y)
 {
+    int baseline_y = y + font->ascent;
+
     XftColor xft_color;
     XRenderColor xrc = { .red = (unsigned short)(((color >> 16) & 0xFF) * 257),
                          .green = (unsigned short)(((color >> 8) & 0xFF) * 257),
@@ -1981,11 +2004,33 @@ draw_glyph__Darkloard(XftDraw *draw,
 
     char utf8[5] = { 0 };
     int utf8_len = codepoint_to_utf8__Darkloard(codepoint, utf8);
-    XftFont *glyph_font = get_font_for_codepoint__Darkloard(codepoint);
+    XftFont *glyph_font = get_font_for_codepoint__Darkloard(codepoint, attrs);
     XftDrawStringUtf8(
-      draw, &xft_color, glyph_font, x, y, (FcChar8 *)utf8, utf8_len);
+      draw, &xft_color, glyph_font, x, baseline_y, (FcChar8 *)utf8, utf8_len);
 
     XftColorFree(display, visual, colormap, &xft_color);
+
+    if (attrs & DARKLOARD_ATTR_UNDERLINE) {
+        XSetForeground(display, window_gc, color);
+        XFillRectangle(display,
+                       back_buffer,
+                       window_gc,
+                       x,
+                       baseline_y + 1,
+                       (unsigned int)cell_w,
+                       1);
+    }
+
+    if (attrs & DARKLOARD_ATTR_STRIKE) {
+        XSetForeground(display, window_gc, color);
+        XFillRectangle(display,
+                       back_buffer,
+                       window_gc,
+                       x,
+                       y + font->ascent / 2,
+                       (unsigned int)cell_w,
+                       1);
+    }
 }
 
 void
@@ -2067,7 +2112,7 @@ draw__Darkloard(void)
 
             if (cell->codepoint != 0 && cell->codepoint != ' ') {
                 draw_glyph__Darkloard(
-                  draw, cell->codepoint, fg, x, y + font->ascent);
+                  draw, cell->codepoint, fg, cell->attrs, cell_w, x, y);
             }
         }
     }
@@ -2092,8 +2137,10 @@ draw__Darkloard(void)
                 draw_glyph__Darkloard(draw,
                                       cur_cell->codepoint,
                                       DARKLOARD_DEFAULT_BG,
+                                      cur_cell->attrs,
+                                      cell_w,
                                       cx,
-                                      cy + font->ascent);
+                                      cy);
             }
         }
     }
@@ -2674,16 +2721,25 @@ load_font__Darkloard(void)
 {
     char *font_name = NULL;
 
-    XASPRINTF(
-      &font_name, "%s:size=%d", DARKLOARD_FONT_NAME, DARKLOARD_FONT_SIZE);
-
+    XASPRINTF(&font_name, "%s:size=%d", DARKLOARD_FONT_NAME, DARKLOARD_FONT_SIZE);
     font = XftFontOpenName(display, screen_num, font_name);
-
     free(font_name);
 
     if (!font) {
         return 1;
     }
+
+    XASPRINTF(&font_name, "%s:size=%d:bold", DARKLOARD_FONT_NAME, DARKLOARD_FONT_SIZE);
+    font_bold = XftFontOpenName(display, screen_num, font_name);
+    free(font_name);
+
+    XASPRINTF(&font_name, "%s:size=%d:italic", DARKLOARD_FONT_NAME, DARKLOARD_FONT_SIZE);
+    font_italic = XftFontOpenName(display, screen_num, font_name);
+    free(font_name);
+
+    XASPRINTF(&font_name, "%s:size=%d:bold:italic", DARKLOARD_FONT_NAME, DARKLOARD_FONT_SIZE);
+    font_bold_italic = XftFontOpenName(display, screen_num, font_name);
+    free(font_name);
 
     return 0;
 }
@@ -2699,10 +2755,12 @@ reload_font__Darkloard(unsigned int new_size)
 
     XftFontClose(display, font);
     font = NULL;
+    if (font_bold) { XftFontClose(display, font_bold); font_bold = NULL; }
+    if (font_italic) { XftFontClose(display, font_italic); font_italic = NULL; }
+    if (font_bold_italic) { XftFontClose(display, font_bold_italic); font_bold_italic = NULL; }
 
     char *font_name = NULL;
-    xasprintf__Darkloard(
-      &font_name, "%s:size=%u", DARKLOARD_FONT_NAME, new_size);
+    xasprintf__Darkloard(&font_name, "%s:size=%u", DARKLOARD_FONT_NAME, new_size);
     font = XftFontOpenName(display, screen_num, font_name);
     free(font_name);
 
@@ -2713,6 +2771,18 @@ reload_font__Darkloard(unsigned int new_size)
         free(font_name);
         return;
     }
+
+    xasprintf__Darkloard(&font_name, "%s:size=%u:bold", DARKLOARD_FONT_NAME, new_size);
+    font_bold = XftFontOpenName(display, screen_num, font_name);
+    free(font_name);
+
+    xasprintf__Darkloard(&font_name, "%s:size=%u:italic", DARKLOARD_FONT_NAME, new_size);
+    font_italic = XftFontOpenName(display, screen_num, font_name);
+    free(font_name);
+
+    xasprintf__Darkloard(&font_name, "%s:size=%u:bold:italic", DARKLOARD_FONT_NAME, new_size);
+    font_bold_italic = XftFontOpenName(display, screen_num, font_name);
+    free(font_name);
 
     current_font_size = new_size;
     handle_window_resize__Darkloard((unsigned short)window_width,
@@ -2728,6 +2798,9 @@ close__Darkloard(void)
 
     font_cache_len = 0;
     XftFontClose(display, font);
+    if (font_bold) XftFontClose(display, font_bold);
+    if (font_italic) XftFontClose(display, font_italic);
+    if (font_bold_italic) XftFontClose(display, font_bold_italic);
 
     if (back_buffer) {
         XFreePixmap(display, back_buffer);
