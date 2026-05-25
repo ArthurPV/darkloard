@@ -66,6 +66,7 @@
 #define DARKLOARD_OSC_BUF_SIZE 1024
 #define DARKLOARD_FONT_CACHE_SIZE 64
 #define DARKLOARD_MAX_READ_BYTES (64 * 1024)
+#define DARKLOARD_HISTORY_LINES 2000
 
 // Every config value that can change during the terminal running.
 struct DarkloardConfig
@@ -204,6 +205,10 @@ static unsigned int back_buffer_height = 0;
 static struct DarkloardCell **inactive_cells = NULL;
 static struct DarkloardCursor main_cursor_saved = { 0 };
 static bool in_alt_screen = false;
+static struct DarkloardCell *history_lines[DARKLOARD_HISTORY_LINES] = { 0 };
+static int history_head = 0;
+static int history_count = 0;
+static int scroll_offset = 0;
 static struct DarkloardScreen screen = { 0 };
 static struct DarkloardParser parser = { 0 };
 static struct DarkloardSelection selection = { 0 };
@@ -305,6 +310,15 @@ feed__DarkloardParser(unsigned char c);
 
 static void
 parse__Darkloard(struct DarkloardMessage *message);
+
+static void
+push_history_line__Darkloard(struct DarkloardCell *line, uint32_t cols);
+
+static struct DarkloardCell *
+get_history_line__Darkloard(int i);
+
+static void
+clear_history__Darkloard(void);
 
 static void
 enter_alt_screen__Darkloard(bool save_cursor);
@@ -686,6 +700,8 @@ deinit__DarkloardScreen(void)
         free(inactive_cells);
         inactive_cells = NULL;
     }
+
+    clear_history__Darkloard();
 }
 
 void
@@ -699,8 +715,14 @@ void
 scroll_up__DarkloardScreen(uint32_t top, uint32_t bottom, uint32_t n)
 {
     uint32_t region_height = bottom - top + 1;
+    bool save = (top == 0 && !in_alt_screen);
 
     if (n >= region_height) {
+        if (save) {
+            for (uint32_t i = top; i <= bottom; i++) {
+                push_history_line__Darkloard(screen.cells[i], screen.cols);
+            }
+        }
         for (uint32_t i = top; i <= bottom; i++) {
             for (uint32_t j = 0; j < screen.cols; j++) {
                 screen.cells[i][j] =
@@ -715,6 +737,10 @@ scroll_up__DarkloardScreen(uint32_t top, uint32_t bottom, uint32_t n)
 
     for (uint32_t i = 0; i < n; i++) {
         struct DarkloardCell *evicted = screen.cells[top];
+
+        if (save) {
+            push_history_line__Darkloard(evicted, screen.cols);
+        }
 
         for (uint32_t row = top; row < bottom; row++) {
             screen.cells[row] = screen.cells[row + 1];
@@ -1705,6 +1731,40 @@ get_font_for_codepoint__Darkloard(uint32_t cp)
 }
 
 void
+push_history_line__Darkloard(struct DarkloardCell *line, uint32_t cols)
+{
+    if (!history_lines[history_head]) {
+        history_lines[history_head] = XMALLOC(cols * sizeof(struct DarkloardCell));
+    }
+    memcpy(history_lines[history_head], line, cols * sizeof(struct DarkloardCell));
+    history_head = (history_head + 1) % DARKLOARD_HISTORY_LINES;
+    if (history_count < DARKLOARD_HISTORY_LINES) {
+        history_count++;
+    }
+}
+
+struct DarkloardCell *
+get_history_line__Darkloard(int i)
+{
+    int idx = ((history_head - history_count + i) % DARKLOARD_HISTORY_LINES +
+               DARKLOARD_HISTORY_LINES) %
+              DARKLOARD_HISTORY_LINES;
+    return history_lines[idx];
+}
+
+void
+clear_history__Darkloard(void)
+{
+    for (int i = 0; i < DARKLOARD_HISTORY_LINES; i++) {
+        free(history_lines[i]);
+        history_lines[i] = NULL;
+    }
+    history_head  = 0;
+    history_count = 0;
+    scroll_offset = 0;
+}
+
+void
 draw__Darkloard(void)
 {
     if (!screen.cells || !back_buffer) {
@@ -1725,8 +1785,30 @@ draw__Darkloard(void)
     int cell_h = font->ascent + font->descent;
 
     for (uint32_t row = 0; row < screen.rows; row++) {
+        struct DarkloardCell *row_cells = NULL;
+        bool from_history = false;
+
+        if (scroll_offset > 0) {
+            int abs = (int)history_count - scroll_offset + (int)row;
+            if (abs >= 0 && abs < (int)history_count) {
+                row_cells   = get_history_line__Darkloard(abs);
+                from_history = true;
+            } else if (abs >= (int)history_count) {
+                uint32_t srow = (uint32_t)(abs - (int)history_count);
+                if (srow < screen.rows) {
+                    row_cells = screen.cells[srow];
+                }
+            }
+        } else {
+            row_cells = screen.cells[row];
+        }
+
+        if (!row_cells) {
+            continue;
+        }
+
         for (uint32_t col = 0; col < screen.cols; col++) {
-            struct DarkloardCell *cell = &screen.cells[row][col];
+            struct DarkloardCell *cell = &row_cells[col];
 
             uint32_t fg = cell->fg;
             uint32_t bg = cell->bg;
@@ -1737,7 +1819,7 @@ draw__Darkloard(void)
                 bg = tmp;
             }
 
-            if (is_selected__DarkloardSelection(row, col)) {
+            if (!from_history && is_selected__DarkloardSelection(row, col)) {
                 fg = DARKLOARD_DEFAULT_BG;
                 bg = DARKLOARD_SELECTION_BG;
             }
@@ -1784,7 +1866,7 @@ draw__Darkloard(void)
         }
     }
 
-    if (screen.cursor.visible) {
+    if (scroll_offset == 0 && screen.cursor.visible) {
         int cx = DARKLOARD_MARGIN_LEFT + (int)screen.cursor.col * cell_w;
         int cy = DARKLOARD_MARGIN_TOP + (int)screen.cursor.row * cell_h;
         XSetForeground(display, window_gc, DARKLOARD_CURSOR_COLOR);
@@ -2070,6 +2152,16 @@ handle_button_press__Darkloard(XButtonEvent *event)
         selection.end_col = selection.start_col;
     } else if (event->button == Button2) {
         request_paste__Darkloard(XA_PRIMARY);
+    } else if (event->button == Button4) {
+        scroll_offset += 3;
+        if (scroll_offset > history_count) {
+            scroll_offset = history_count;
+        }
+    } else if (event->button == Button5) {
+        scroll_offset -= 3;
+        if (scroll_offset < 0) {
+            scroll_offset = 0;
+        }
     }
 }
 
@@ -2112,6 +2204,25 @@ handle_keypress__Darkloard(XKeyEvent *event)
     char buf[32];
     KeySym keysym = NoSymbol;
     int len = XLookupString(event, buf, (int)sizeof(buf) - 1, &keysym, NULL);
+
+    if (event->state & ShiftMask) {
+        if (keysym == XK_Page_Up) {
+            scroll_offset += (int)screen.rows / 2;
+            if (scroll_offset > history_count) {
+                scroll_offset = history_count;
+            }
+            return;
+        }
+        if (keysym == XK_Page_Down) {
+            scroll_offset -= (int)screen.rows / 2;
+            if (scroll_offset < 0) {
+                scroll_offset = 0;
+            }
+            return;
+        }
+    }
+
+    scroll_offset = 0;
 
     if ((event->state & ControlMask) && (event->state & ShiftMask)) {
         if (keysym == XK_c || keysym == XK_C) {
