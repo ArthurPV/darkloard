@@ -212,11 +212,13 @@ static int scroll_offset = 0;
 static struct DarkloardScreen screen = { 0 };
 static struct DarkloardParser parser = { 0 };
 static struct DarkloardSelection selection = { 0 };
+static bool running = true;
 
 static Atom atom_utf8_string = None;
 static Atom atom_clipboard = None;
 static Atom atom_targets = None;
 static Atom atom_xsel_data = None;
+static Atom atom_wm_delete = None;
 
 static inline struct DarkloardMessage
 init__DarkloardMessage(char *buffer, size_t buffer_len);
@@ -1734,9 +1736,11 @@ void
 push_history_line__Darkloard(struct DarkloardCell *line, uint32_t cols)
 {
     if (!history_lines[history_head]) {
-        history_lines[history_head] = XMALLOC(cols * sizeof(struct DarkloardCell));
+        history_lines[history_head] =
+          XMALLOC(cols * sizeof(struct DarkloardCell));
     }
-    memcpy(history_lines[history_head], line, cols * sizeof(struct DarkloardCell));
+    memcpy(
+      history_lines[history_head], line, cols * sizeof(struct DarkloardCell));
     history_head = (history_head + 1) % DARKLOARD_HISTORY_LINES;
     if (history_count < DARKLOARD_HISTORY_LINES) {
         history_count++;
@@ -1759,7 +1763,7 @@ clear_history__Darkloard(void)
         free(history_lines[i]);
         history_lines[i] = NULL;
     }
-    history_head  = 0;
+    history_head = 0;
     history_count = 0;
     scroll_offset = 0;
 }
@@ -1791,7 +1795,7 @@ draw__Darkloard(void)
         if (scroll_offset > 0) {
             int abs = (int)history_count - scroll_offset + (int)row;
             if (abs >= 0 && abs < (int)history_count) {
-                row_cells   = get_history_line__Darkloard(abs);
+                row_cells = get_history_line__Darkloard(abs);
                 from_history = true;
             } else if (abs >= (int)history_count) {
                 uint32_t srow = (uint32_t)(abs - (int)history_count);
@@ -1931,6 +1935,9 @@ init_atoms__Darkloard(void)
     atom_clipboard = XInternAtom(display, "CLIPBOARD", False);
     atom_targets = XInternAtom(display, "TARGETS", False);
     atom_xsel_data = XInternAtom(display, "XSEL_DATA", False);
+    atom_wm_delete = XInternAtom(display, "WM_DELETE_WINDOW", False);
+
+    XSetWMProtocols(display, window, &atom_wm_delete, 1);
 }
 
 void
@@ -2312,6 +2319,14 @@ handle_x_events__Darkloard(void)
 
         switch (event.type) {
             case Expose:
+                draw__Darkloard();
+
+                break;
+            case ClientMessage:
+                if (event.xclient.data.l[0] == atom_wm_delete) {
+                    running = false;
+                }
+
                 break;
             case KeyPress:
                 handle_keypress__Darkloard(&event.xkey);
@@ -2394,7 +2409,7 @@ poll__Darkloard(void)
     struct pollfd fds[FDS_LEN] = { { .fd = display_fd, .events = POLLIN },
                                    { .fd = pty_master_fd, .events = POLLIN } };
 
-    while (is_terminal_alive__Darkloard()) {
+    while (is_terminal_alive__Darkloard() && running) {
         int ret = poll(fds, FDS_LEN, -1);
 
         if (ret > 0) {
@@ -2446,7 +2461,8 @@ reload_font__Darkloard(unsigned int new_size)
     font = NULL;
 
     char *font_name = NULL;
-    xasprintf__Darkloard(&font_name, "%s:size=%u", DARKLOARD_FONT_NAME, new_size);
+    xasprintf__Darkloard(
+      &font_name, "%s:size=%u", DARKLOARD_FONT_NAME, new_size);
     font = XftFontOpenName(display, screen_num, font_name);
     free(font_name);
 
