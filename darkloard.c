@@ -20,6 +20,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <wchar.h>
+#include <pwd.h>
 
 #include <linux/limits.h>
 
@@ -203,6 +204,7 @@ static struct DarkloardCell **inactive_cells = NULL;
 static struct DarkloardCursor main_cursor_saved = { 0 };
 static bool in_alt_screen = false;
 static struct DarkloardCell *history_lines[DARKLOARD_HISTORY_LINES] = { 0 };
+static uint32_t history_line_cols[DARKLOARD_HISTORY_LINES] = { 0 };
 static int history_head = 0;
 static int history_count = 0;
 static int scroll_offset = 0;
@@ -261,6 +263,9 @@ write_pty__Darkloard(char *buffer, size_t buffer_len);
 
 static void
 init__DarkloardScreen(uint32_t rows, uint32_t cols);
+
+static void
+free_cells__DarkloardScreen(void);
 
 static void
 deinit__DarkloardScreen(void);
@@ -512,7 +517,7 @@ open_terminal__Darkloard(int slave_fd, char *slave_filename)
     pid_t pid = fork();
 
     switch (pid) {
-        case 0:
+        case 0: {
             if (setsid() == -1) {
                 goto child_end;
             } else if (ioctl(slave_fd, TIOCSCTTY, 0) == -1) {
@@ -528,10 +533,37 @@ open_terminal__Darkloard(int slave_fd, char *slave_filename)
             }
 
             close(slave_fd);
+
+			struct passwd *pw = NULL;
+
+			pw = getpwuid(getuid());
+
+			if (!pw) {
+				LOG_ERROR("failed to run `getpwuid`");
+
+				goto child_end;
+			}
+
+			if (setenv("LOGNAME", pw->pw_name, 1) == -1) {
+				goto setenv_failed;
+			} else if (setenv("USER", pw->pw_name, 1) == -1) {
+				goto setenv_failed;
+			} else if (setenv("SHELL", shell, 1) == -1) {
+				goto setenv_failed;
+			} else if (setenv("HOME", pw->pw_dir, 1) == -1) {
+				goto setenv_failed;
+			} else if (setenv("TERM", "xterm-256color", 1) == -1) {
+				goto setenv_failed;
+			}
+
             execv(shell, shell_argv);
 
         child_end:
             exit(1);
+		setenv_failed:
+			LOG_ERROR("failed to execute setenv");
+			exit(1);
+		}
         case -1:
             LOG_ERROR("failed to fork process (%s)", strerror(errno));
 
@@ -698,7 +730,7 @@ init__DarkloardScreen(uint32_t rows, uint32_t cols)
 }
 
 void
-deinit__DarkloardScreen(void)
+free_cells__DarkloardScreen(void)
 {
     if (screen.cells) {
         for (uint32_t i = 0; i < screen.rows; i++) {
@@ -715,14 +747,20 @@ deinit__DarkloardScreen(void)
         free(inactive_cells);
         inactive_cells = NULL;
     }
+}
 
+void
+deinit__DarkloardScreen(void)
+{
+    free_cells__DarkloardScreen();
     clear_history__Darkloard();
 }
 
 void
 resize__DarkloardScreen(uint32_t rows, uint32_t cols)
 {
-    deinit__DarkloardScreen();
+    scroll_offset = 0;
+    free_cells__DarkloardScreen();
     init__DarkloardScreen(rows, cols);
 }
 
@@ -1837,7 +1875,7 @@ get_font_for_codepoint__Darkloard(uint32_t cp)
     }
 
     FcPattern *pat = FcPatternCreate();
-    FcPatternAddDouble(pat, FC_SIZE, (double)DARKLOARD_FONT_SIZE);
+    FcPatternAddDouble(pat, FC_SIZE, (double)current_font_size);
     FcCharSet *cs = FcCharSetCreate();
     FcCharSetAddChar(cs, (FcChar32)cp);
     FcPatternAddCharSet(pat, FC_CHARSET, cs);
@@ -1874,25 +1912,42 @@ get_font_for_codepoint__Darkloard(uint32_t cp)
 void
 push_history_line__Darkloard(struct DarkloardCell *line, uint32_t cols)
 {
+    if (history_lines[history_head] &&
+        history_line_cols[history_head] != cols) {
+        free(history_lines[history_head]);
+        history_lines[history_head] = NULL;
+    }
     if (!history_lines[history_head]) {
         history_lines[history_head] =
           XMALLOC(cols * sizeof(struct DarkloardCell));
     }
     memcpy(
       history_lines[history_head], line, cols * sizeof(struct DarkloardCell));
+    history_line_cols[history_head] = cols;
     history_head = (history_head + 1) % DARKLOARD_HISTORY_LINES;
     if (history_count < DARKLOARD_HISTORY_LINES) {
         history_count++;
     }
 }
 
+static int
+history_line_idx__Darkloard(int i)
+{
+    return ((history_head - history_count + i) % DARKLOARD_HISTORY_LINES +
+            DARKLOARD_HISTORY_LINES) %
+           DARKLOARD_HISTORY_LINES;
+}
+
 struct DarkloardCell *
 get_history_line__Darkloard(int i)
 {
-    int idx = ((history_head - history_count + i) % DARKLOARD_HISTORY_LINES +
-               DARKLOARD_HISTORY_LINES) %
-              DARKLOARD_HISTORY_LINES;
-    return history_lines[idx];
+    return history_lines[history_line_idx__Darkloard(i)];
+}
+
+static uint32_t
+get_history_line_cols__Darkloard(int i)
+{
+    return history_line_cols[history_line_idx__Darkloard(i)];
 }
 
 void
@@ -1901,6 +1956,7 @@ clear_history__Darkloard(void)
     for (int i = 0; i < DARKLOARD_HISTORY_LINES; i++) {
         free(history_lines[i]);
         history_lines[i] = NULL;
+        history_line_cols[i] = 0;
     }
     history_head = 0;
     history_count = 0;
@@ -1952,12 +2008,15 @@ draw__Darkloard(void)
 
     for (uint32_t row = 0; row < screen.rows; row++) {
         struct DarkloardCell *row_cells = NULL;
+        uint32_t row_cols = screen.cols;
         bool from_history = false;
 
         if (scroll_offset > 0) {
             int abs = (int)history_count - scroll_offset + (int)row;
             if (abs >= 0 && abs < (int)history_count) {
                 row_cells = get_history_line__Darkloard(abs);
+                uint32_t hcols = get_history_line_cols__Darkloard(abs);
+                row_cols = hcols < screen.cols ? hcols : screen.cols;
                 from_history = true;
             } else if (abs >= (int)history_count) {
                 uint32_t srow = (uint32_t)(abs - (int)history_count);
@@ -1973,7 +2032,7 @@ draw__Darkloard(void)
             continue;
         }
 
-        for (uint32_t col = 0; col < screen.cols; col++) {
+        for (uint32_t col = 0; col < row_cols; col++) {
             struct DarkloardCell *cell = &row_cells[col];
 
             uint32_t fg = cell->fg;
@@ -2057,6 +2116,9 @@ draw__Darkloard(void)
 void
 handle_window_resize__Darkloard(unsigned short xpixel, unsigned short ypixel)
 {
+    window_width = xpixel;
+    window_height = ypixel;
+
     unsigned short num_cols = (unsigned short)((xpixel - DARKLOARD_MARGIN_LEFT -
                                                 DARKLOARD_MARGIN_RIGHT) /
                                                font->max_advance_width);

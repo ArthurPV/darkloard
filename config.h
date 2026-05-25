@@ -4,7 +4,7 @@
 #define RGB(r, g, b) ((r) << 16 | (g) << 8 | (b))
 
 #define DARKLOARD_FONT_NAME "Monaspace Xenon"
-#define DARKLOARD_FONT_SIZE 20
+#define DARKLOARD_FONT_SIZE 14
 
 #define DARKLOARD_MARGIN_TOP 10
 #define DARKLOARD_MARGIN_BOTTOM 10
