@@ -139,6 +139,7 @@ struct DarkloardScreen
     uint8_t current_attrs;
     struct DarkloardCursor saved_cursor;
     bool saved_cursor_valid;
+    bool is_dirty;
 };
 
 enum DarkloardParseState
@@ -1642,6 +1643,8 @@ parse__Darkloard(struct DarkloardMessage *message)
     for (size_t i = 0; i < message->buffer_len; i++) {
         feed__DarkloardParser((unsigned char)message->buffer[i]);
     }
+
+    screen.is_dirty = true;
 }
 
 void
@@ -1771,7 +1774,7 @@ clear_history__Darkloard(void)
 void
 draw__Darkloard(void)
 {
-    if (!screen.cells || !back_buffer) {
+    if (!screen.is_dirty || !screen.cells || !back_buffer) {
         return;
     }
 
@@ -1896,6 +1899,8 @@ draw__Darkloard(void)
               0,
               0);
     XFlush(display);
+
+    screen.is_dirty = false;
 }
 
 void
@@ -2316,6 +2321,8 @@ handle_x_events__Darkloard(void)
         XEvent event;
 
         XNextEvent(display, &event);
+
+        screen.is_dirty = true;
 
         switch (event.type) {
             case Expose:
