@@ -11,6 +11,7 @@
 #include <locale.h>
 #include <poll.h>
 #include <pty.h>
+#include <pwd.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -20,7 +21,6 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <wchar.h>
-#include <pwd.h>
 
 #include <linux/limits.h>
 
@@ -534,36 +534,38 @@ open_terminal__Darkloard(int slave_fd, char *slave_filename)
 
             close(slave_fd);
 
-			struct passwd *pw = NULL;
+            struct passwd *pw = NULL;
 
-			pw = getpwuid(getuid());
+            pw = getpwuid(getuid());
 
-			if (!pw) {
-				LOG_ERROR("failed to run `getpwuid`");
+            if (!pw) {
+                LOG_ERROR("failed to run `getpwuid`");
 
-				goto child_end;
-			}
+                goto child_end;
+            }
 
-			if (setenv("LOGNAME", pw->pw_name, 1) == -1) {
-				goto setenv_failed;
-			} else if (setenv("USER", pw->pw_name, 1) == -1) {
-				goto setenv_failed;
-			} else if (setenv("SHELL", shell, 1) == -1) {
-				goto setenv_failed;
-			} else if (setenv("HOME", pw->pw_dir, 1) == -1) {
-				goto setenv_failed;
-			} else if (setenv("TERM", "xterm-256color", 1) == -1) {
-				goto setenv_failed;
-			}
+            if (setenv("LOGNAME", pw->pw_name, 1) == -1) {
+                goto setenv_failed;
+            } else if (setenv("USER", pw->pw_name, 1) == -1) {
+                goto setenv_failed;
+            } else if (setenv("SHELL", shell, 1) == -1) {
+                goto setenv_failed;
+            } else if (setenv("HOME", pw->pw_dir, 1) == -1) {
+                goto setenv_failed;
+            } else if (setenv("TERM", "xterm-256color", 1) == -1) {
+                goto setenv_failed;
+            } else if (setenv("COLORTERM", "truecolor", 1) == -1) {
+                goto setenv_failed;
+            }
 
             execv(shell, shell_argv);
 
         child_end:
             exit(1);
-		setenv_failed:
-			LOG_ERROR("failed to execute setenv");
-			exit(1);
-		}
+        setenv_failed:
+            LOG_ERROR("failed to execute setenv");
+            exit(1);
+        }
         case -1:
             LOG_ERROR("failed to fork process (%s)", strerror(errno));
 
