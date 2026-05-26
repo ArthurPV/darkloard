@@ -214,8 +214,8 @@ static unsigned int back_buffer_height = 0;
 static struct DarkloardCell **inactive_cells = NULL;
 static struct DarkloardCursor main_cursor_saved = { 0 };
 static bool in_alt_screen = false;
-static struct DarkloardCell *history_lines[DARKLOARD_HISTORY_LINES] = { 0 };
-static uint32_t history_line_cols[DARKLOARD_HISTORY_LINES] = { 0 };
+static struct DarkloardCell **history_lines = NULL;
+static uint32_t *history_line_cols = NULL;
 static int history_head = 0;
 static int history_count = 0;
 static int scroll_offset = 0;
@@ -338,6 +338,9 @@ parse__Darkloard(struct DarkloardMessage *message);
 
 static void
 push_history_line__Darkloard(struct DarkloardCell *line, uint32_t cols);
+
+static void
+init_history__Darkloard(void);
 
 static struct DarkloardCell *
 get_history_line__Darkloard(int i);
@@ -2032,6 +2035,14 @@ history_line_idx__Darkloard(int i)
            DARKLOARD_HISTORY_LINES;
 }
 
+void
+init_history__Darkloard(void)
+{
+    history_lines =
+      XMALLOC(sizeof(struct DarkloardCell *) * DARKLOARD_HISTORY_LINES);
+    history_line_cols = XMALLOC(sizeof(uint32_t) * DARKLOARD_HISTORY_LINES);
+}
+
 struct DarkloardCell *
 get_history_line__Darkloard(int i)
 {
@@ -2052,9 +2063,15 @@ clear_history__Darkloard(void)
         history_lines[i] = NULL;
         history_line_cols[i] = 0;
     }
+
+    free(history_lines);
+    free(history_line_cols);
+
     history_head = 0;
     history_count = 0;
     scroll_offset = 0;
+    history_lines = NULL;
+    history_line_cols = NULL;
 }
 
 void
@@ -2954,6 +2971,7 @@ main()
     XMapWindow(display, window);
 
     init_atoms__Darkloard();
+    init_history__Darkloard();
     open_pty__Darkloard();
     handle_window_resize__Darkloard((unsigned short)window_width,
                                     (unsigned short)window_height);
