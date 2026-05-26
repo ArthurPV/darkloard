@@ -2,6 +2,7 @@
 #define DARKLOARD_CONFIG_H
 
 #define RGB(r, g, b) ((r) << 16 | (g) << 8 | (b))
+#define HEX(v) (0x##v)
 
 #define DARKLOARD_FONT_NAME "monospace"
 #define DARKLOARD_FONT_SIZE 10
