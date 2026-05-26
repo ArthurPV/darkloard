@@ -514,6 +514,7 @@ is_terminal_alive__Darkloard(void)
 {
     if (terminal_process.shell_pid == 0 ||
         waitpid(terminal_process.shell_pid, NULL, WNOHANG) != 0) {
+
         return false;
     }
 
@@ -536,17 +537,17 @@ open_terminal__Darkloard(int slave_fd, char *slave_filename)
     switch (pid) {
         case 0: {
             if (setsid() == -1) {
-                goto child_end;
+                goto configure_error;
             } else if (ioctl(slave_fd, TIOCSCTTY, 0) == -1) {
-                goto child_end;
+                goto configure_error;
             } else if (dup2(slave_fd, STDIN_FILENO) == -1) {
-                goto child_end;
+                goto configure_error;
             } else if (dup2(slave_fd, STDOUT_FILENO) == -1) {
-                goto child_end;
+                goto configure_error;
             } else if (dup2(slave_fd, STDERR_FILENO) == -1) {
-                goto child_end;
+                goto configure_error;
             } else if (configure_terminal__Darkloard(slave_fd) == -1) {
-                goto child_end;
+                goto configure_error;
             }
 
             close(slave_fd);
@@ -558,7 +559,7 @@ open_terminal__Darkloard(int slave_fd, char *slave_filename)
             if (!pw) {
                 LOG_ERROR("failed to run `getpwuid`");
 
-                goto child_end;
+                goto configure_error;
             }
 
             if (setenv("LOGNAME", pw->pw_name, 1) == -1) {
@@ -576,12 +577,15 @@ open_terminal__Darkloard(int slave_fd, char *slave_filename)
             }
 
             execv(shell, shell_argv);
+            exit(EXIT_SUCCESS);
 
-        child_end:
-            exit(1);
+        configure_error:
+            LOG_ERROR("failed to configure the terminal: %s", strerror(errno));
+            exit(EXIT_FAILURE);
+
         setenv_failed:
-            LOG_ERROR("failed to execute setenv");
-            exit(1);
+            LOG_ERROR("failed to execute setenv: %s", strerror(errno));
+            exit(EXIT_FAILURE);
         }
         case -1:
             LOG_ERROR("failed to fork process (%s)", strerror(errno));
@@ -719,7 +723,6 @@ init__DarkloardScreen(uint32_t rows, uint32_t cols)
     screen.saved_cursor_valid = false;
     screen.pending_wrap = false;
     screen.auto_wrap = true;
-
     screen.cells = XMALLOC(rows * sizeof(struct DarkloardCell *));
 
     for (uint32_t i = 0; i < rows; i++) {
@@ -757,6 +760,7 @@ free_cells__DarkloardScreen(void)
         for (uint32_t i = 0; i < screen.rows; i++) {
             free(screen.cells[i]);
         }
+
         free(screen.cells);
         screen.cells = NULL;
     }
@@ -765,6 +769,7 @@ free_cells__DarkloardScreen(void)
         for (uint32_t i = 0; i < screen.rows; i++) {
             free(inactive_cells[i]);
         }
+
         free(inactive_cells);
         inactive_cells = NULL;
     }
@@ -791,6 +796,7 @@ resize__DarkloardScreen(uint32_t rows, uint32_t cols)
 
     free_cells__DarkloardScreen();
     init__DarkloardScreen(rows, cols);
+
     if (was_in_alt) {
         struct DarkloardCell **tmp = screen.cells;
         screen.cells = inactive_cells;
@@ -813,6 +819,7 @@ scroll_up__DarkloardScreen(uint32_t top, uint32_t bottom, uint32_t n)
                 push_history_line__Darkloard(screen.cells[i], screen.cols);
             }
         }
+
         for (uint32_t i = top; i <= bottom; i++) {
             for (uint32_t j = 0; j < screen.cols; j++) {
                 screen.cells[i][j] =
@@ -822,6 +829,7 @@ scroll_up__DarkloardScreen(uint32_t top, uint32_t bottom, uint32_t n)
                                           .attrs = 0 };
             }
         }
+
         return;
     }
 
@@ -863,6 +871,7 @@ scroll_down__DarkloardScreen(uint32_t top, uint32_t bottom, uint32_t n)
                                           .attrs = 0 };
             }
         }
+
         return;
     }
 
@@ -894,6 +903,7 @@ put_char__DarkloardScreen(uint32_t codepoint)
     }
 
     int width = wcwidth((wchar_t)codepoint);
+
     if (width < 0) {
         width = 1;
     }
@@ -902,6 +912,7 @@ put_char__DarkloardScreen(uint32_t codepoint)
     if (screen.pending_wrap && screen.auto_wrap) {
         screen.pending_wrap = false;
         screen.cursor.col = 0;
+
         if (screen.cursor.row == screen.scroll_region.bottom) {
             scroll_up__DarkloardScreen(
               screen.scroll_region.top, screen.scroll_region.bottom, 1);
@@ -919,8 +930,10 @@ put_char__DarkloardScreen(uint32_t codepoint)
                                   .fg = screen.current_fg,
                                   .bg = screen.current_bg,
                                   .attrs = screen.current_attrs };
+
         if (screen.auto_wrap) {
             screen.cursor.col = 0;
+
             if (screen.cursor.row == screen.scroll_region.bottom) {
                 scroll_up__DarkloardScreen(
                   screen.scroll_region.top, screen.scroll_region.bottom, 1);
@@ -970,12 +983,14 @@ erase_display__DarkloardScreen(int mode)
             for (uint32_t col = screen.cursor.col; col < screen.cols; col++) {
                 screen.cells[screen.cursor.row][col] = blank;
             }
+
             for (uint32_t row = screen.cursor.row + 1; row < screen.rows;
                  row++) {
                 for (uint32_t col = 0; col < screen.cols; col++) {
                     screen.cells[row][col] = blank;
                 }
             }
+
             break;
         case 1:
             for (uint32_t row = 0; row < screen.cursor.row; row++) {
@@ -983,9 +998,11 @@ erase_display__DarkloardScreen(int mode)
                     screen.cells[row][col] = blank;
                 }
             }
+
             for (uint32_t col = 0; col <= screen.cursor.col; col++) {
                 screen.cells[screen.cursor.row][col] = blank;
             }
+
             break;
         case 2:
         case 3:
@@ -994,6 +1011,7 @@ erase_display__DarkloardScreen(int mode)
                     screen.cells[row][col] = blank;
                 }
             }
+
             break;
         default:
             break;
@@ -1013,16 +1031,19 @@ erase_line__DarkloardScreen(int mode)
             for (uint32_t col = screen.cursor.col; col < screen.cols; col++) {
                 screen.cells[screen.cursor.row][col] = blank;
             }
+
             break;
         case 1:
             for (uint32_t col = 0; col <= screen.cursor.col; col++) {
                 screen.cells[screen.cursor.row][col] = blank;
             }
+
             break;
         case 2:
             for (uint32_t col = 0; col < screen.cols; col++) {
                 screen.cells[screen.cursor.row][col] = blank;
             }
+
             break;
         default:
             break;
@@ -1034,21 +1055,25 @@ codepoint_to_utf8__Darkloard(uint32_t cp, char *buf)
 {
     if (cp < 0x80) {
         buf[0] = (char)cp;
+
         return 1;
     } else if (cp < 0x800) {
         buf[0] = (char)(0xC0 | (cp >> 6));
         buf[1] = (char)(0x80 | (cp & 0x3F));
+
         return 2;
     } else if (cp < 0x10000) {
         buf[0] = (char)(0xE0 | (cp >> 12));
         buf[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
         buf[2] = (char)(0x80 | (cp & 0x3F));
+
         return 3;
     } else {
         buf[0] = (char)(0xF0 | (cp >> 18));
         buf[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
         buf[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
         buf[3] = (char)(0x80 | (cp & 0x3F));
+
         return 4;
     }
 }
@@ -1068,30 +1093,37 @@ handle_normal__DarkloardParser(unsigned char c)
             if (screen.cursor.col > 0) {
                 screen.cursor.col--;
             }
+
             break;
         case DARKLOARD_HT: {
             uint32_t next_tab = (screen.cursor.col / DARKLOARD_TAB_WIDTH + 1) *
                                 DARKLOARD_TAB_WIDTH;
+
             if (next_tab >= screen.cols) {
                 next_tab = screen.cols - 1;
             }
+
             screen.cursor.col = next_tab;
+
             break;
         }
         case DARKLOARD_LF:
         case DARKLOARD_VT:
         case DARKLOARD_FF:
             screen.pending_wrap = false;
+
             if (screen.cursor.row == screen.scroll_region.bottom) {
                 scroll_up__DarkloardScreen(
                   screen.scroll_region.top, screen.scroll_region.bottom, 1);
             } else if (screen.cursor.row < screen.rows - 1) {
                 screen.cursor.row++;
             }
+
             break;
         case DARKLOARD_CR:
             screen.pending_wrap = false;
             screen.cursor.col = 0;
+
             break;
         case DARKLOARD_SO:
         case DARKLOARD_SI:
@@ -1100,16 +1132,20 @@ handle_normal__DarkloardParser(unsigned char c)
         case DARKLOARD_SUB:
             parser.utf8_remaining = 0;
             parser.state = DARKLOARD_PARSE_STATE_NORMAL;
+
             break;
         case DARKLOARD_ESC:
             parser.utf8_remaining = 0;
             parser.state = DARKLOARD_PARSE_STATE_ESC;
+
             break;
         case DARKLOARD_DEL:
             break;
         case DARKLOARD_CSI:
             memset(&parser.csi, 0, sizeof(parser.csi));
+
             parser.state = DARKLOARD_PARSE_STATE_CSI;
+
             break;
         default:
             if (c >= 0xF0 && c <= 0xF4) {
@@ -1126,14 +1162,17 @@ handle_normal__DarkloardParser(unsigned char c)
                     parser.utf8_codepoint =
                       (parser.utf8_codepoint << 6) | (c & 0x3F);
                     parser.utf8_remaining--;
+
                     if (parser.utf8_remaining == 0) {
                         put_char__DarkloardScreen(parser.utf8_codepoint);
                     }
                 }
             } else if (c >= 0x20) {
                 parser.utf8_remaining = 0;
+
                 put_char__DarkloardScreen(c);
             }
+
             break;
     }
 }
@@ -1146,22 +1185,27 @@ handle_esc__DarkloardParser(unsigned char c)
     switch (c) {
         case '[':
             memset(&parser.csi, 0, sizeof(parser.csi));
+
             parser.state = DARKLOARD_PARSE_STATE_CSI;
+
             break;
         case ']':
             parser.osc_len = 0;
             parser.osc_esc_pending = false;
             parser.state = DARKLOARD_PARSE_STATE_OSC;
+
             break;
         case '7':
             screen.saved_cursor = screen.cursor;
             screen.saved_cursor_valid = true;
+
             break;
         case '8':
             if (screen.saved_cursor_valid) {
                 screen.pending_wrap = false;
                 screen.cursor = screen.saved_cursor;
             }
+
             break;
         case 'c':
             screen.pending_wrap = false;
@@ -1173,24 +1217,30 @@ handle_esc__DarkloardParser(unsigned char c)
             screen.current_attrs = 0;
             screen.scroll_region.top = 0;
             screen.scroll_region.bottom = screen.rows - 1;
+
             erase_display__DarkloardScreen(2);
+
             break;
         case 'D':
             screen.cursor.row++;
+
             if (screen.cursor.row > screen.scroll_region.bottom) {
                 screen.cursor.row = screen.scroll_region.bottom;
                 scroll_up__DarkloardScreen(
                   screen.scroll_region.top, screen.scroll_region.bottom, 1);
             }
+
             break;
         case 'E':
             screen.cursor.col = 0;
             screen.cursor.row++;
+
             if (screen.cursor.row > screen.scroll_region.bottom) {
                 screen.cursor.row = screen.scroll_region.bottom;
                 scroll_up__DarkloardScreen(
                   screen.scroll_region.top, screen.scroll_region.bottom, 1);
             }
+
             break;
         case 'M':
             if (screen.cursor.row == screen.scroll_region.top) {
@@ -1199,12 +1249,14 @@ handle_esc__DarkloardParser(unsigned char c)
             } else if (screen.cursor.row > 0) {
                 screen.cursor.row--;
             }
+
             break;
         case 'H':
             break;
         case '(':
         case ')':
             parser.state = DARKLOARD_PARSE_STATE_CHARSET;
+
             break;
         case 'P':
         case '_':
@@ -1212,6 +1264,7 @@ handle_esc__DarkloardParser(unsigned char c)
         case 'X':
             parser.str_esc_pending = false;
             parser.state = DARKLOARD_PARSE_STATE_STR_SKIP;
+
             break;
         case '=':
         case '>':
@@ -1247,6 +1300,7 @@ handle_csi_byte__DarkloardParser(unsigned char c)
         int idx = parser.csi.params_len - 1;
 
         parser.csi.params[idx] = parser.csi.params[idx] * 10 + (c - '0');
+
         return;
     }
 
@@ -1258,13 +1312,16 @@ handle_csi_byte__DarkloardParser(unsigned char c)
         if (parser.csi.params_len < DARKLOARD_CSI_MAX_PARAMS) {
             parser.csi.params_len++;
         }
+
         return;
     }
 
     if (c >= 0x40 && c <= 0x7E) {
         parser.csi.final_byte = c;
         parser.state = DARKLOARD_PARSE_STATE_NORMAL;
+
         handle_csi__DarkloardParser();
+
         return;
     }
 
@@ -1283,58 +1340,71 @@ handle_csi__DarkloardParser(void)
         case 'A': {
             int n = CSI_PARAM(0, 1);
             int new_row = (int)screen.cursor.row - n;
+
             screen.pending_wrap = false;
             screen.cursor.row = new_row < (int)screen.scroll_region.top
                                   ? screen.scroll_region.top
                                   : (uint32_t)new_row;
+
             break;
         }
         case 'B': {
             int n = CSI_PARAM(0, 1);
             int new_row = (int)screen.cursor.row + n;
+
             screen.pending_wrap = false;
             screen.cursor.row = new_row > (int)screen.scroll_region.bottom
                                   ? screen.scroll_region.bottom
                                   : (uint32_t)new_row;
+
             break;
         }
         case 'C': {
             int n = CSI_PARAM(0, 1);
             int new_col = (int)screen.cursor.col + n;
+
             screen.pending_wrap = false;
             screen.cursor.col =
               new_col >= (int)screen.cols ? screen.cols - 1 : (uint32_t)new_col;
+
             break;
         }
         case 'D': {
             int n = CSI_PARAM(0, 1);
             int new_col = (int)screen.cursor.col - n;
+
             screen.pending_wrap = false;
             screen.cursor.col = new_col < 0 ? 0 : (uint32_t)new_col;
+
             break;
         }
         case 'E': {
             int n = CSI_PARAM(0, 1);
             int new_row = (int)screen.cursor.row + n;
+
             screen.pending_wrap = false;
             screen.cursor.row = new_row > (int)screen.scroll_region.bottom
                                   ? screen.scroll_region.bottom
                                   : (uint32_t)new_row;
             screen.cursor.col = 0;
+
             break;
         }
         case 'F': {
             int n = CSI_PARAM(0, 1);
             int new_row = (int)screen.cursor.row - n;
+
             screen.pending_wrap = false;
             screen.cursor.row = new_row < (int)screen.scroll_region.top
                                   ? screen.scroll_region.top
                                   : (uint32_t)new_row;
             screen.cursor.col = 0;
+
             break;
         }
         case 'G': {
             int col = CSI_PARAM(0, 1) - 1;
+
             screen.pending_wrap = false;
             screen.cursor.col = (col < 0)                      ? 0
                                 : (uint32_t)col >= screen.cols ? screen.cols - 1
@@ -1345,6 +1415,7 @@ handle_csi__DarkloardParser(void)
         case 'f': {
             int row = CSI_PARAM(0, 1) - 1;
             int col = CSI_PARAM(1, 1) - 1;
+
             screen.pending_wrap = false;
             screen.cursor.row = (row < 0)                      ? 0
                                 : (uint32_t)row >= screen.rows ? screen.rows - 1
@@ -1356,24 +1427,32 @@ handle_csi__DarkloardParser(void)
         }
         case 'J': {
             int mode = parser.csi.params_len > 0 ? parser.csi.params[0] : 0;
+
             erase_display__DarkloardScreen(mode);
+
             break;
         }
         case 'K': {
             int mode = parser.csi.params_len > 0 ? parser.csi.params[0] : 0;
+
             erase_line__DarkloardScreen(mode);
+
             break;
         }
         case 'L': {
             int n = CSI_PARAM(0, 1);
+
             scroll_down__DarkloardScreen(
               screen.cursor.row, screen.scroll_region.bottom, (uint32_t)n);
+
             break;
         }
         case 'M': {
             int n = CSI_PARAM(0, 1);
+
             scroll_up__DarkloardScreen(
               screen.cursor.row, screen.scroll_region.bottom, (uint32_t)n);
+
             break;
         }
         case 'P': {
@@ -1395,10 +1474,12 @@ handle_csi__DarkloardParser(void)
                                           .bg = screen.current_bg,
                                           .attrs = 0 };
             }
+
             break;
         }
         case 'S': {
             int n = CSI_PARAM(0, 1);
+
             scroll_up__DarkloardScreen(screen.scroll_region.top,
                                        screen.scroll_region.bottom,
                                        (uint32_t)n);
@@ -1406,6 +1487,7 @@ handle_csi__DarkloardParser(void)
         }
         case 'T': {
             int n = CSI_PARAM(0, 1);
+
             scroll_down__DarkloardScreen(screen.scroll_region.top,
                                          screen.scroll_region.bottom,
                                          (uint32_t)n);
@@ -1413,6 +1495,7 @@ handle_csi__DarkloardParser(void)
         }
         case 'X': {
             int n = CSI_PARAM(0, 1);
+
             for (int j = 0;
                  j < n && screen.cursor.col + (uint32_t)j < screen.cols;
                  j++) {
@@ -1423,6 +1506,7 @@ handle_csi__DarkloardParser(void)
                                           .bg = screen.current_bg,
                                           .attrs = 0 };
             }
+
             break;
         }
         case '@': {
@@ -1444,32 +1528,39 @@ handle_csi__DarkloardParser(void)
                                           .bg = screen.current_bg,
                                           .attrs = 0 };
             }
+
             break;
         }
         case 'I': {
             int n = CSI_PARAM(0, 1);
+
             for (int j = 0; j < n; j++) {
                 uint32_t next_tab =
                   (screen.cursor.col / DARKLOARD_TAB_WIDTH + 1) *
                   DARKLOARD_TAB_WIDTH;
                 screen.cursor.col =
                   next_tab >= screen.cols ? screen.cols - 1 : next_tab;
+
                 if (next_tab >= screen.cols) {
                     break;
                 }
             }
+
             break;
         }
         case 'Z': {
             int n = CSI_PARAM(0, 1);
+
             for (int j = 0; j < n; j++) {
                 if (screen.cursor.col == 0) {
                     break;
                 }
+
                 uint32_t prev_tab = (screen.cursor.col - 1) /
                                     DARKLOARD_TAB_WIDTH * DARKLOARD_TAB_WIDTH;
                 screen.cursor.col = prev_tab;
             }
+
             break;
         }
         case 'c':
@@ -1478,22 +1569,27 @@ handle_csi__DarkloardParser(void)
             } else {
                 write_pty__Darkloard("\033[>1;10;0c", 10);
             }
+
             break;
         case 'd': {
             int row = CSI_PARAM(0, 1) - 1;
+
             screen.pending_wrap = false;
             screen.cursor.row = (row < 0)                      ? 0
                                 : (uint32_t)row >= screen.rows ? screen.rows - 1
                                                                : (uint32_t)row;
+
             break;
         }
         case 'm':
             handle_sgr__DarkloardParser();
+
             break;
         case 'q':
             break;
         case 'n': {
             int mode = parser.csi.params_len > 0 ? parser.csi.params[0] : 0;
+
             if (mode == 6) {
                 char response[32];
                 int len = snprintf(response,
@@ -1501,39 +1597,50 @@ handle_csi__DarkloardParser(void)
                                    "\033[%u;%uR",
                                    screen.cursor.row + 1,
                                    screen.cursor.col + 1);
+
                 write_pty__Darkloard(response, (size_t)len);
             }
+
             break;
         }
         case 'r': {
             int top = CSI_PARAM(0, 1);
             int bottom = CSI_PARAM(1, (int)screen.rows);
+
             if (top < bottom && (uint32_t)bottom <= screen.rows) {
                 screen.scroll_region.top = (uint32_t)(top - 1);
                 screen.scroll_region.bottom = (uint32_t)(bottom - 1);
             }
+
             screen.pending_wrap = false;
             screen.cursor.row = 0;
             screen.cursor.col = 0;
+
             break;
         }
         case 'h':
         case 'l': {
             bool set = parser.csi.final_byte == 'h';
+
             if (parser.csi.private_mode) {
                 int mode = parser.csi.params_len > 0 ? parser.csi.params[0] : 0;
+
                 switch (mode) {
                     case 1:
                         app_cursor_keys = set;
+
                         break;
                     case 7:
                         screen.auto_wrap = set;
+
                         if (!set) {
                             screen.pending_wrap = false;
                         }
+
                         break;
                     case 25:
                         screen.cursor.visible = set;
+
                         break;
                     case 47:
                     case 1047:
@@ -1542,6 +1649,7 @@ handle_csi__DarkloardParser(void)
                         } else {
                             leave_alt_screen__Darkloard(false);
                         }
+
                         break;
                     case 1000:
                     case 1001:
@@ -1552,6 +1660,7 @@ handle_csi__DarkloardParser(void)
                         break;
                     case 1004:
                         focus_events = set;
+
                         break;
                     case 1049:
                         if (set) {
@@ -1559,25 +1668,30 @@ handle_csi__DarkloardParser(void)
                         } else {
                             leave_alt_screen__Darkloard(true);
                         }
+
                         break;
                     case 2004:
                         bracketed_paste = set;
+
                         break;
                     default:
                         break;
                 }
             }
+
             break;
         }
         case 's':
             screen.saved_cursor = screen.cursor;
             screen.saved_cursor_valid = true;
+
             break;
         case 'u':
             if (screen.saved_cursor_valid) {
                 screen.pending_wrap = false;
                 screen.cursor = screen.saved_cursor;
             }
+
             break;
         default:
             break;
@@ -1608,52 +1722,68 @@ handle_sgr__DarkloardParser(void)
                 screen.current_fg = DARKLOARD_DEFAULT_FG;
                 screen.current_bg = DARKLOARD_DEFAULT_BG;
                 screen.current_attrs = 0;
+
                 break;
             case 1:
                 screen.current_attrs |= DARKLOARD_ATTR_BOLD;
+
                 break;
             case 2:
                 screen.current_attrs |= DARKLOARD_ATTR_DIM;
+
                 break;
             case 3:
                 screen.current_attrs |= DARKLOARD_ATTR_ITALIC;
+
                 break;
             case 4:
                 screen.current_attrs |= DARKLOARD_ATTR_UNDERLINE;
+
                 break;
             case 5:
                 screen.current_attrs |= DARKLOARD_ATTR_BLINK;
+
                 break;
             case 7:
                 screen.current_attrs |= DARKLOARD_ATTR_REVERSE;
+
                 break;
             case 8:
                 screen.current_attrs |= DARKLOARD_ATTR_INVISIBLE;
+
                 break;
             case 9:
                 screen.current_attrs |= DARKLOARD_ATTR_STRIKE;
+
                 break;
             case 22:
                 screen.current_attrs &=
                   (uint8_t)~(DARKLOARD_ATTR_BOLD | DARKLOARD_ATTR_DIM);
+
                 break;
             case 23:
                 screen.current_attrs &= (uint8_t)~DARKLOARD_ATTR_ITALIC;
+
                 break;
             case 24:
                 screen.current_attrs &= (uint8_t)~DARKLOARD_ATTR_UNDERLINE;
+
                 break;
             case 25:
                 screen.current_attrs &= (uint8_t)~DARKLOARD_ATTR_BLINK;
+
                 break;
             case 27:
                 screen.current_attrs &= (uint8_t)~DARKLOARD_ATTR_REVERSE;
+
                 break;
             case 28:
                 screen.current_attrs &= (uint8_t)~DARKLOARD_ATTR_INVISIBLE;
+
                 break;
             case 29:
                 screen.current_attrs &= (uint8_t)~DARKLOARD_ATTR_STRIKE;
+
                 break;
             case 30:
             case 31:
@@ -1664,6 +1794,7 @@ handle_sgr__DarkloardParser(void)
             case 36:
             case 37:
                 screen.current_fg = ansi_colors[p - 30];
+
                 break;
             case 38:
                 if (i + 2 < params_len && parser.csi.params[i + 1] == 5) {
@@ -1677,9 +1808,11 @@ handle_sgr__DarkloardParser(void)
                                             parser.csi.params[i + 4]);
                     i += 4;
                 }
+
                 break;
             case 39:
                 screen.current_fg = DARKLOARD_DEFAULT_FG;
+
                 break;
             case 40:
             case 41:
@@ -1690,6 +1823,7 @@ handle_sgr__DarkloardParser(void)
             case 46:
             case 47:
                 screen.current_bg = ansi_colors[p - 40];
+
                 break;
             case 48:
                 if (i + 2 < params_len && parser.csi.params[i + 1] == 5) {
@@ -1703,9 +1837,11 @@ handle_sgr__DarkloardParser(void)
                                             parser.csi.params[i + 4]);
                     i += 4;
                 }
+
                 break;
             case 49:
                 screen.current_bg = DARKLOARD_DEFAULT_BG;
+
                 break;
             case 90:
             case 91:
@@ -1716,6 +1852,7 @@ handle_sgr__DarkloardParser(void)
             case 96:
             case 97:
                 screen.current_fg = ansi_colors[p - 90 + 8];
+
                 break;
             case 100:
             case 101:
@@ -1726,6 +1863,7 @@ handle_sgr__DarkloardParser(void)
             case 106:
             case 107:
                 screen.current_bg = ansi_colors[p - 100 + 8];
+
                 break;
             default:
                 break;
@@ -1738,21 +1876,26 @@ handle_osc_byte__DarkloardParser(unsigned char c)
 {
     if (c == DARKLOARD_BEL) {
         handle_osc__DarkloardParser();
+
         parser.osc_len = 0;
         parser.state = DARKLOARD_PARSE_STATE_NORMAL;
+
         return;
     }
 
     if (c == DARKLOARD_ESC) {
         parser.osc_esc_pending = true;
+
         return;
     }
 
     if (c == '\\' && parser.osc_esc_pending) {
         handle_osc__DarkloardParser();
+
         parser.osc_len = 0;
         parser.osc_esc_pending = false;
         parser.state = DARKLOARD_PARSE_STATE_NORMAL;
+
         return;
     }
 
@@ -1760,6 +1903,7 @@ handle_osc_byte__DarkloardParser(unsigned char c)
         parser.osc_len = 0;
         parser.osc_esc_pending = false;
         parser.state = DARKLOARD_PARSE_STATE_NORMAL;
+
         return;
     }
 
@@ -1794,6 +1938,7 @@ handle_osc__DarkloardParser(void)
             case 2: {
                 const char *title = parser.osc_buf + i + 1;
                 int title_len = parser.osc_len - i - 1;
+
                 XStoreName(display, window, title);
                 XChangeProperty(display,
                                 window,
@@ -1803,6 +1948,7 @@ handle_osc__DarkloardParser(void)
                                 PropModeReplace,
                                 (const unsigned char *)title,
                                 title_len);
+
                 break;
             }
             default:
@@ -1816,18 +1962,21 @@ handle_str_skip__DarkloardParser(unsigned char c)
 {
     if (c == DARKLOARD_ESC) {
         parser.str_esc_pending = true;
+
         return;
     }
 
     if (c == '\\' && parser.str_esc_pending) {
         parser.str_esc_pending = false;
         parser.state = DARKLOARD_PARSE_STATE_NORMAL;
+
         return;
     }
 
     if (c == DARKLOARD_BEL || c == DARKLOARD_CAN || c == DARKLOARD_SUB) {
         parser.str_esc_pending = false;
         parser.state = DARKLOARD_PARSE_STATE_NORMAL;
+
         return;
     }
 
@@ -1856,15 +2005,18 @@ xterm256_to_rgb__Darkloard(int idx)
 
     if (idx < 232) {
         idx -= 16;
+
         int r = idx / 36, g = (idx / 6) % 6, b = idx % 6;
         int rv = r ? 55 + r * 40 : 0;
         int gv = g ? 55 + g * 40 : 0;
         int bv = b ? 55 + b * 40 : 0;
+
         return RGB(rv, gv, bv);
     }
 
     if (idx < 256) {
         int v = 8 + (idx - 232) * 10;
+
         return RGB(v, v, v);
     }
 
@@ -1877,21 +2029,29 @@ feed__DarkloardParser(unsigned char c)
     switch (parser.state) {
         case DARKLOARD_PARSE_STATE_NORMAL:
             handle_normal__DarkloardParser(c);
+
             break;
         case DARKLOARD_PARSE_STATE_ESC:
             handle_esc__DarkloardParser(c);
+
             break;
         case DARKLOARD_PARSE_STATE_CSI:
             handle_csi_byte__DarkloardParser(c);
+
             break;
         case DARKLOARD_PARSE_STATE_OSC:
             handle_osc_byte__DarkloardParser(c);
+
             break;
         case DARKLOARD_PARSE_STATE_CHARSET:
             parser.state = DARKLOARD_PARSE_STATE_NORMAL;
+
             break;
         case DARKLOARD_PARSE_STATE_STR_SKIP:
             handle_str_skip__DarkloardParser(c);
+
+            break;
+        default:
             break;
     }
 }
@@ -1918,14 +2078,14 @@ enter_alt_screen__Darkloard(bool save_cursor)
     }
 
     struct DarkloardCell **tmp = screen.cells;
+
     screen.cells = inactive_cells;
     inactive_cells = tmp;
-
     in_alt_screen = true;
-
     screen.pending_wrap = false;
     screen.cursor.row = 0;
     screen.cursor.col = 0;
+
     erase_display__DarkloardScreen(2);
 }
 
@@ -1937,17 +2097,19 @@ leave_alt_screen__Darkloard(bool restore_cursor)
     }
 
     struct DarkloardCell **tmp = screen.cells;
+
     screen.cells = inactive_cells;
     inactive_cells = tmp;
-
     in_alt_screen = false;
 
     if (restore_cursor) {
         screen.pending_wrap = false;
         screen.cursor = main_cursor_saved;
+
         if (screen.cursor.row >= screen.rows) {
             screen.cursor.row = screen.rows > 0 ? screen.rows - 1 : 0;
         }
+
         if (screen.cursor.col >= screen.cols) {
             screen.cursor.col = screen.cols > 0 ? screen.cols - 1 : 0;
         }
@@ -1972,8 +2134,11 @@ get_font_for_codepoint__Darkloard(uint32_t cp, uint8_t attrs)
     }
 
     FcPattern *pat = FcPatternCreate();
+
     FcPatternAddDouble(pat, FC_SIZE, (double)current_font_size);
+
     FcCharSet *cs = FcCharSetCreate();
+
     FcCharSetAddChar(cs, (FcChar32)cp);
     FcPatternAddCharSet(pat, FC_CHARSET, cs);
     FcCharSetDestroy(cs);
@@ -1982,6 +2147,7 @@ get_font_for_codepoint__Darkloard(uint32_t cp, uint8_t attrs)
 
     FcResult result;
     FcPattern *match = FcFontMatch(NULL, pat, &result);
+
     FcPatternDestroy(pat);
 
     if (!match) {
@@ -1989,6 +2155,7 @@ get_font_for_codepoint__Darkloard(uint32_t cp, uint8_t attrs)
     }
 
     XftFont *fb = XftFontOpenPattern(display, match);
+
     if (!fb) {
         return fonts[FONT_REGULAR];
     }
@@ -2000,6 +2167,7 @@ get_font_for_codepoint__Darkloard(uint32_t cp, uint8_t attrs)
         memmove(font_cache,
                 font_cache + 1,
                 (DARKLOARD_FONT_CACHE_SIZE - 1) * sizeof(XftFont *));
+
         font_cache[DARKLOARD_FONT_CACHE_SIZE - 1] = fb;
     }
 
@@ -2014,14 +2182,18 @@ push_history_line__Darkloard(struct DarkloardCell *line, uint32_t cols)
         free(history_lines[history_head]);
         history_lines[history_head] = NULL;
     }
+
     if (!history_lines[history_head]) {
         history_lines[history_head] =
           XMALLOC(cols * sizeof(struct DarkloardCell));
     }
+
     memcpy(
       history_lines[history_head], line, cols * sizeof(struct DarkloardCell));
+
     history_line_cols[history_head] = cols;
     history_head = (history_head + 1) % DARKLOARD_HISTORY_LINES;
+
     if (history_count < DARKLOARD_HISTORY_LINES) {
         history_count++;
     }
@@ -2084,20 +2256,20 @@ draw_glyph__Darkloard(XftDraw *draw,
                       int y)
 {
     int baseline_y = y + fonts[FONT_REGULAR]->ascent;
-
     XftColor xft_color;
     XRenderColor xrc = { .red = (unsigned short)(((color >> 16) & 0xFF) * 257),
                          .green = (unsigned short)(((color >> 8) & 0xFF) * 257),
                          .blue = (unsigned short)(((color) & 0xFF) * 257),
                          .alpha = 0xFFFF };
+
     XftColorAllocValue(display, visual, colormap, &xrc, &xft_color);
 
     char utf8[5] = { 0 };
     int utf8_len = codepoint_to_utf8__Darkloard(codepoint, utf8);
     XftFont *glyph_font = get_font_for_codepoint__Darkloard(codepoint, attrs);
+
     XftDrawStringUtf8(
       draw, &xft_color, glyph_font, x, baseline_y, (FcChar8 *)utf8, utf8_len);
-
     XftColorFree(display, visual, colormap, &xft_color);
 
     if (attrs & DARKLOARD_ATTR_UNDERLINE) {
@@ -2150,13 +2322,16 @@ draw__Darkloard(void)
 
         if (scroll_offset > 0) {
             int abs = (int)history_count - scroll_offset + (int)row;
+
             if (abs >= 0 && abs < (int)history_count) {
-                row_cells = get_history_line__Darkloard(abs);
                 uint32_t hcols = get_history_line_cols__Darkloard(abs);
+
+                row_cells = get_history_line__Darkloard(abs);
                 row_cols = hcols < screen.cols ? hcols : screen.cols;
                 from_history = true;
             } else if (abs >= (int)history_count) {
                 uint32_t srow = (uint32_t)(abs - (int)history_count);
+
                 if (srow < screen.rows) {
                     row_cells = screen.cells[srow];
                 }
@@ -2171,12 +2346,12 @@ draw__Darkloard(void)
 
         for (uint32_t col = 0; col < row_cols; col++) {
             struct DarkloardCell *cell = &row_cells[col];
-
             uint32_t fg = cell->fg;
             uint32_t bg = cell->bg;
 
             if (cell->attrs & DARKLOARD_ATTR_REVERSE) {
                 uint32_t tmp = fg;
+
                 fg = bg;
                 bg = tmp;
             }
@@ -2210,6 +2385,7 @@ draw__Darkloard(void)
     if (scroll_offset == 0 && screen.cursor.visible) {
         int cx = DARKLOARD_MARGIN_LEFT + (int)screen.cursor.col * cell_w;
         int cy = DARKLOARD_MARGIN_TOP + (int)screen.cursor.row * cell_h;
+
         XSetForeground(display, window_gc, DARKLOARD_CURSOR_COLOR);
         XFillRectangle(display,
                        back_buffer,
@@ -2223,6 +2399,7 @@ draw__Darkloard(void)
             screen.cursor.col < screen.cols) {
             struct DarkloardCell *cur_cell =
               &screen.cells[screen.cursor.row][screen.cursor.col];
+
             if (cur_cell->codepoint != 0 && cur_cell->codepoint != ' ') {
                 draw_glyph__Darkloard(draw,
                                       cur_cell->codepoint,
@@ -2236,7 +2413,6 @@ draw__Darkloard(void)
     }
 
     XftDrawDestroy(draw);
-
     XCopyArea(display,
               back_buffer,
               window,
@@ -2274,6 +2450,7 @@ handle_window_resize__Darkloard(unsigned short xpixel, unsigned short ypixel)
     if (back_buffer) {
         XFreePixmap(display, back_buffer);
     }
+
     back_buffer =
       XCreatePixmap(display,
                     window,
@@ -2304,6 +2481,7 @@ void
 deinit__DarkloardSelection(void)
 {
     free(selection.text);
+
     selection.text = NULL;
     selection.text_len = 0;
     selection.active = false;
@@ -2338,9 +2516,12 @@ is_selected__DarkloardSelection(uint32_t row, uint32_t col)
 
     if (r1 > r2 || (r1 == r2 && c1 > c2)) {
         uint32_t tr = r1;
+
         r1 = r2;
         r2 = tr;
+
         uint32_t tc = c1;
+
         c1 = c2;
         c2 = tc;
     }
@@ -2348,12 +2529,15 @@ is_selected__DarkloardSelection(uint32_t row, uint32_t col)
     if (row < r1 || row > r2) {
         return false;
     }
+
     if (row == r1 && col < c1) {
         return false;
     }
+
     if (row == r2 && col > c2) {
         return false;
     }
+
     return true;
 }
 
@@ -2361,6 +2545,7 @@ void
 build_selection_text__DarkloardSelection(void)
 {
     free(selection.text);
+
     selection.text = NULL;
     selection.text_len = 0;
 
@@ -2373,9 +2558,12 @@ build_selection_text__DarkloardSelection(void)
 
     if (r1 > r2 || (r1 == r2 && c1 > c2)) {
         uint32_t tr = r1;
+
         r1 = r2;
         r2 = tr;
+
         uint32_t tc = c1;
+
         c1 = c2;
         c2 = tc;
     }
@@ -2387,10 +2575,10 @@ build_selection_text__DarkloardSelection(void)
     for (uint32_t row = r1; row <= r2; row++) {
         uint32_t col_start = (row == r1) ? c1 : 0;
         uint32_t col_end = (row == r2) ? c2 : screen.cols - 1;
-
         // Find last non-space in this row segment to strip trailing whitespace.
         uint32_t last = col_start;
         bool has_content = false;
+
         for (uint32_t c = col_end + 1; c-- > col_start;) {
             uint32_t cp = screen.cells[row][c].codepoint;
             if (cp != 0 && cp != ' ') {
@@ -2403,11 +2591,14 @@ build_selection_text__DarkloardSelection(void)
         if (has_content) {
             for (uint32_t c = col_start; c <= last; c++) {
                 uint32_t cp = screen.cells[row][c].codepoint;
+
                 if (cp == 0) {
                     cp = ' ';
                 }
-                char utf8[5];
+
+                char utf8[5] = { 0 };
                 int utf8_len = codepoint_to_utf8__Darkloard(cp, utf8);
+
                 memcpy(buf + len, utf8, (size_t)utf8_len);
                 len += (size_t)utf8_len;
             }
@@ -2449,6 +2640,7 @@ handle_selection_request__Darkloard(XSelectionRequestEvent *req)
 
     if (req->target == atom_targets) {
         Atom supported[2] = { atom_utf8_string, XA_STRING };
+
         XChangeProperty(req->display,
                         req->requestor,
                         req->property,
@@ -2467,6 +2659,7 @@ handle_selection_request__Darkloard(XSelectionRequestEvent *req)
                         PropModeReplace,
                         (unsigned char *)selection.text,
                         (int)selection.text_len);
+
         notify.property = req->property;
     }
 
@@ -2502,7 +2695,9 @@ handle_selection_notify__Darkloard(XSelectionEvent *event)
         if (bracketed_paste) {
             write_pty__Darkloard("\033[200~", 6);
         }
+
         write_pty__Darkloard((char *)data, nitems);
+
         if (bracketed_paste) {
             write_pty__Darkloard("\033[201~", 6);
         }
@@ -2518,9 +2713,12 @@ handle_button_press__Darkloard(XButtonEvent *event)
 {
     if (event->button == Button1) {
         deinit__DarkloardSelection();
+
         selection.selecting = true;
+
         pixel_to_cell__Darkloard(
           event->x, event->y, &selection.start_row, &selection.start_col);
+
         selection.end_row = selection.start_row;
         selection.end_col = selection.start_col;
     } else if (event->button == Button2) {
@@ -2532,6 +2730,7 @@ handle_button_press__Darkloard(XButtonEvent *event)
             }
         } else {
             scroll_offset += 3;
+
             if (scroll_offset > history_count) {
                 scroll_offset = history_count;
             }
@@ -2543,6 +2742,7 @@ handle_button_press__Darkloard(XButtonEvent *event)
             }
         } else {
             scroll_offset -= 3;
+
             if (scroll_offset < 0) {
                 scroll_offset = 0;
             }
@@ -2568,6 +2768,7 @@ handle_button_release__Darkloard(XButtonEvent *event)
     }
 
     selection.active = true;
+
     build_selection_text__DarkloardSelection();
     XSetSelectionOwner(display, XA_PRIMARY, window, CurrentTime);
 }
@@ -2591,59 +2792,80 @@ handle_keypress__Darkloard(XKeyEvent *event)
     int len = XLookupString(event, buf, (int)sizeof(buf) - 1, &keysym, NULL);
 
     if (event->state & ShiftMask) {
-        if (keysym == XK_Page_Up) {
-            scroll_offset += (int)screen.rows / 2;
-            if (scroll_offset > history_count) {
-                scroll_offset = history_count;
-            }
-            return;
-        }
-        if (keysym == XK_Page_Down) {
-            scroll_offset -= (int)screen.rows / 2;
-            if (scroll_offset < 0) {
-                scroll_offset = 0;
-            }
-            return;
+        switch (keysym) {
+            case XK_Page_Up:
+                scroll_offset += (int)screen.rows / 2;
+
+                if (scroll_offset > history_count) {
+                    scroll_offset = history_count;
+                }
+
+                return;
+            case XK_Page_Down:
+                scroll_offset -= (int)screen.rows / 2;
+
+                if (scroll_offset < 0) {
+                    scroll_offset = 0;
+                }
+
+                return;
+            default:
+                break;
         }
     }
 
     scroll_offset = 0;
 
     if ((event->state & ControlMask) && (event->state & ShiftMask)) {
-        if (keysym == XK_c || keysym == XK_C) {
-            if (selection.active && selection.text_len > 0) {
-                XSetSelectionOwner(
-                  display, atom_clipboard, window, CurrentTime);
-            }
-            return;
-        }
-        if (keysym == XK_v || keysym == XK_V) {
-            request_paste__Darkloard(atom_clipboard);
-            return;
+        switch (keysym) {
+            case XK_c:
+            case XK_C:
+                if (selection.active && selection.text_len > 0) {
+                    XSetSelectionOwner(
+                      display, atom_clipboard, window, CurrentTime);
+                }
+
+                return;
+            case XK_v:
+            case XK_V:
+                request_paste__Darkloard(atom_clipboard);
+
+                return;
+            default:
+                break;
         }
     }
 
     if (event->state & ControlMask) {
-        if (keysym == XK_plus || keysym == XK_equal || keysym == XK_KP_Add) {
-            if (current_font_size < 72) {
-                reload_font__Darkloard(current_font_size + 1);
-            }
-            return;
-        }
-        if (keysym == XK_minus || keysym == XK_KP_Subtract) {
-            if (current_font_size > 4) {
-                reload_font__Darkloard(current_font_size - 1);
-            }
-            return;
-        }
-        if (keysym == XK_0 || keysym == XK_KP_0) {
-            reload_font__Darkloard(DARKLOARD_FONT_SIZE);
-            return;
+        switch (keysym) {
+            case XK_plus:
+            case XK_equal:
+            case XK_KP_Add:
+                if (current_font_size < 72) {
+                    reload_font__Darkloard(current_font_size + 1);
+                }
+
+                break;
+            case XK_minus:
+            case XK_KP_Subtract:
+                if (current_font_size > 4) {
+                    reload_font__Darkloard(current_font_size - 1);
+                }
+
+                break;
+            case XK_0:
+            case XK_KP_0:
+                reload_font__Darkloard(DARKLOARD_FONT_SIZE);
+
+                break;
+            default:
+                break;
         }
     }
 
     if (len > 0) {
         write_pty__Darkloard(buf, (size_t)len);
+
         return;
     }
 
@@ -2651,36 +2873,47 @@ handle_keypress__Darkloard(XKeyEvent *event)
         case XK_Return:
         case XK_KP_Enter:
             write_pty__Darkloard("\r", 1);
+
             break;
         case XK_BackSpace:
             write_pty__Darkloard("\177", 1);
+
             break;
         case XK_Delete:
             write_pty__Darkloard("\033[3~", 4);
+
             break;
         case XK_Up:
             write_pty__Darkloard(app_cursor_keys ? "\033OA" : "\033[A", 3);
+
             break;
         case XK_Down:
             write_pty__Darkloard(app_cursor_keys ? "\033OB" : "\033[B", 3);
+
             break;
         case XK_Right:
             write_pty__Darkloard(app_cursor_keys ? "\033OC" : "\033[C", 3);
+
             break;
         case XK_Left:
             write_pty__Darkloard(app_cursor_keys ? "\033OD" : "\033[D", 3);
+
             break;
         case XK_Home:
             write_pty__Darkloard("\033[H", 3);
+
             break;
         case XK_End:
             write_pty__Darkloard("\033[F", 3);
+
             break;
         case XK_Page_Up:
             write_pty__Darkloard("\033[5~", 4);
+
             break;
         case XK_Page_Down:
             write_pty__Darkloard("\033[6~", 4);
+
             break;
         default:
             break;
@@ -2710,34 +2943,43 @@ handle_x_events__Darkloard(void)
                 break;
             case KeyPress:
                 handle_keypress__Darkloard(&event.xkey);
+
                 break;
             case ButtonPress:
                 handle_button_press__Darkloard(&event.xbutton);
+
                 break;
             case ButtonRelease:
                 handle_button_release__Darkloard(&event.xbutton);
+
                 break;
             case MotionNotify:
                 handle_motion__Darkloard(&event.xmotion);
+
                 break;
             case SelectionRequest:
                 handle_selection_request__Darkloard(&event.xselectionrequest);
+
                 break;
             case SelectionNotify:
                 handle_selection_notify__Darkloard(&event.xselection);
+
                 break;
             case FocusIn:
                 if (focus_events) {
                     write_pty__Darkloard("\033[I", 3);
                 }
+
                 break;
             case FocusOut:
                 if (focus_events) {
                     write_pty__Darkloard("\033[O", 3);
                 }
+
                 break;
             case SelectionClear:
                 deinit__DarkloardSelection();
+
                 break;
             case ConfigureNotify: {
                 XConfigureEvent configure_event = event.xconfigure;
@@ -2745,6 +2987,7 @@ handle_x_events__Darkloard(void)
                 handle_window_resize__Darkloard(
                   (unsigned short)configure_event.width,
                   (unsigned short)configure_event.height);
+
                 break;
             }
             default:
@@ -2783,6 +3026,7 @@ handle_pty_events__Darkloard(void)
 
         struct DarkloardMessage message =
           init__DarkloardMessage(read_buffer, read_buffer_len);
+
         parse__Darkloard(&message);
         free(read_buffer);
 
@@ -2835,7 +3079,9 @@ load_font__Darkloard(void)
                   DARKLOARD_FONT_NAME,
                   DARKLOARD_FONT_SIZE,
                   suffixes[v]);
+
         fonts[v] = XftFontOpenName(display, screen_num, font_name);
+
         free(font_name);
     }
 
@@ -2847,13 +3093,16 @@ reload_font__Darkloard(unsigned int new_size)
 {
     for (int i = 0; i < font_cache_len; i++) {
         XftFontClose(display, font_cache[i]);
+
         font_cache[i] = NULL;
     }
+
     font_cache_len = 0;
 
     for (int v = 0; v < FONT_COUNT; v++) {
         if (fonts[v]) {
             XftFontClose(display, fonts[v]);
+
             fonts[v] = NULL;
         }
     }
@@ -2865,14 +3114,19 @@ reload_font__Darkloard(unsigned int new_size)
 
     xasprintf__Darkloard(
       &font_name, "%s:size=%u", DARKLOARD_FONT_NAME, new_size);
+
     fonts[FONT_REGULAR] = XftFontOpenName(display, screen_num, font_name);
+
     free(font_name);
 
     if (!fonts[FONT_REGULAR]) {
         xasprintf__Darkloard(
           &font_name, "%s:size=%u", DARKLOARD_FONT_NAME, current_font_size);
+
         fonts[FONT_REGULAR] = XftFontOpenName(display, screen_num, font_name);
+
         free(font_name);
+
         return;
     }
 
@@ -2882,11 +3136,14 @@ reload_font__Darkloard(unsigned int new_size)
                              DARKLOARD_FONT_NAME,
                              new_size,
                              suffixes[v]);
+
         fonts[v] = XftFontOpenName(display, screen_num, font_name);
+
         free(font_name);
     }
 
     current_font_size = new_size;
+
     handle_window_resize__Darkloard((unsigned short)window_width,
                                     (unsigned short)window_height);
 }
@@ -2899,6 +3156,7 @@ close__Darkloard(void)
     }
 
     font_cache_len = 0;
+
     for (int v = 0; v < FONT_COUNT; v++) {
         if (fonts[v]) {
             XftFontClose(display, fonts[v]);
@@ -2935,7 +3193,6 @@ main()
     }
 
     display_fd = ConnectionNumber(display);
-
     screen_num = DefaultScreen(display);
     colormap = DefaultColormap(display, screen_num);
     visual = DefaultVisual(display, screen_num);
