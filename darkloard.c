@@ -628,7 +628,7 @@ open_terminal__Darkloard(int slave_fd, char *slave_filename)
             }
 #else
 #error "This OS is not supported"
-#endif /* __linux */
+#endif /* __linux__ */
 
             execv(shell, shell_argv);
             exit(EXIT_SUCCESS);
