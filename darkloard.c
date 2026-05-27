@@ -1052,6 +1052,7 @@ erase_line__DarkloardScreen(int mode)
 int
 codepoint_to_utf8__Darkloard(uint32_t cp, char *buf)
 {
+    // See RFC 3629
     if (cp < 0x80) {
         buf[0] = (char)cp;
 
