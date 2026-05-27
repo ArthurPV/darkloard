@@ -619,11 +619,11 @@ open_terminal__Darkloard(int slave_fd, char *slave_filename)
                 goto setenv_failed;
             }
 #if defined(__linux__)
-	    else if (setenv("COLORTERM", "truecolor", 1) == -1) {
+            else if (setenv("COLORTERM", "truecolor", 1) == -1) {
                 goto setenv_failed;
             }
 #elif defined(__FreeBSD__)
-	    else if (setenv("CLICOLOR", "1", 1) == -1) {
+            else if (setenv("CLICOLOR", "1", 1) == -1) {
                 goto setenv_failed;
             }
 #else
