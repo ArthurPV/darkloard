@@ -9,6 +9,7 @@ extensive support or new features to be added any time soon.
 ## OS supported
 
 - Linux
+- FreeBSD
 
 ## Requirements
 

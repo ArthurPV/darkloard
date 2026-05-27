@@ -26,7 +26,6 @@
 #include <fcntl.h>
 #include <locale.h>
 #include <poll.h>
-#include <pty.h>
 #include <pwd.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -38,7 +37,37 @@
 #include <unistd.h>
 #include <wchar.h>
 
+#if defined(__linux__)
+#include <pty.h>
+#elif defined(__FreeBSD__)
+#include <libutil.h>
+#else
+#error "This OS is not supported"
+#endif /* __linux__ */
+
+#if defined(__linux__)
 #include <linux/limits.h>
+#elif defined(__FreeBSD__)
+#include <sys/syslimits.h>
+#else
+#error "This OS is not supported"
+#endif /* __linux__ */
+
+#if defined(__linux__)
+/* Nothing needed */
+#elif defined(__FreeBSD__)
+#include <termios.h>
+#else
+#error "This OS is not supported"
+#endif /* __linux__ */
+
+#if defined(__linux__)
+/* Nothing needed */
+#elif defined(__FreeBSD__)
+#include <signal.h>
+#else
+#error "This OS is not supported"
+#endif /* __linux__ */
 
 #include "config.h"
 
@@ -588,9 +617,18 @@ open_terminal__Darkloard(int slave_fd, char *slave_filename)
                 goto setenv_failed;
             } else if (setenv("TERM", "xterm-256color", 1) == -1) {
                 goto setenv_failed;
-            } else if (setenv("COLORTERM", "truecolor", 1) == -1) {
+            }
+#if defined(__linux__)
+	    else if (setenv("COLORTERM", "truecolor", 1) == -1) {
                 goto setenv_failed;
             }
+#elif defined(__FreeBSD__)
+	    else if (setenv("CLICOLOR", "1", 1) == -1) {
+                goto setenv_failed;
+            }
+#else
+#error "This OS is not supported"
+#endif /* __linux */
 
             execv(shell, shell_argv);
             exit(EXIT_SUCCESS);
