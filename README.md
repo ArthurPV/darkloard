@@ -10,6 +10,7 @@ extensive support or new features to be added any time soon.
 
 - Linux
 - FreeBSD
+- NetBSD
 
 ## Requirements
 
