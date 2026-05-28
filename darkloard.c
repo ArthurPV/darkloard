@@ -45,7 +45,7 @@
 #include <util.h>
 #else
 #error "This OS is not supported"
-#endif /* __linux__ */
+#endif /* defined(__linux__) */
 
 #if defined(__linux__)
 #include <linux/limits.h>
@@ -53,27 +53,19 @@
 #include <sys/syslimits.h>
 #else
 #error "This OS is not supported"
-#endif /* __linux__ */
+#endif /* defined(__linux__) */
 
-#if defined(__linux__)
-/* Nothing needed */
-#elif defined(__FreeBSD__) || defined(__NetBSD__)
+#if defined(__FreeBSD__) || defined(__NetBSD__)
 #include <termios.h>
-#else
-#error "This OS is not supported"
-#endif /* __linux__ */
+#endif /* defined(__FreeBSD__) || defined(__NetBSD__) */
 
-#if defined(__linux__)
-/* Nothing needed */
-#elif defined(__FreeBSD__) || defined(__NetBSD__)
+#if defined(__FreeBSD__) || defined(__NetBSD__)
 #include <signal.h>
-#else
-#error "This OS is not supported"
-#endif /* __linux__ */
+#endif /* defined(__FreeBSD__) || defined(__NetBSD__) */
 
 #if defined(__NetBSD__)
 #include <sys/ioctl.h>
-#endif /* __NetBSD__ */
+#endif /* defined(__NetBSD__) */
 
 #include "config.h"
 
@@ -634,7 +626,7 @@ open_terminal__Darkloard(int slave_fd, char *slave_filename)
             }
 #else
 #error "This OS is not supported"
-#endif /* __linux__ */
+#endif /* defined(__linux__) */
 
             execv(shell, shell_argv);
             exit(EXIT_SUCCESS);
