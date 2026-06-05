@@ -540,7 +540,13 @@ configure_terminal__Darkloard(int slave_fd)
         return 1;
     }
 
-    tios.c_iflag |= ICRNL;
+#if defined(__linux__)
+#define C_IFLAG ICRNL | IUTF8
+#else
+#define C_IFLAG ICRNL
+#endif
+
+    tios.c_iflag |= C_IFLAG;
     tios.c_oflag |= OPOST | ONLCR;
     tios.c_lflag |= ISIG | ICANON | ECHO | IEXTEN;
     tios.c_cflag |= CREAD | CS8;
@@ -550,6 +556,8 @@ configure_terminal__Darkloard(int slave_fd)
     }
 
     return 0;
+
+#undef C_IFLAG
 }
 
 bool
