@@ -2905,19 +2905,19 @@ handle_keypress__Darkloard(XKeyEvent *event)
                     reload_font__Darkloard(current_font_size + 1);
                 }
 
-                break;
+                return;
             case XK_minus:
             case XK_KP_Subtract:
                 if (current_font_size > 4) {
                     reload_font__Darkloard(current_font_size - 1);
                 }
 
-                break;
+                return;
             case XK_0:
             case XK_KP_0:
                 reload_font__Darkloard(DARKLOARD_FONT_SIZE);
 
-                break;
+                return;
             default:
                 break;
         }
