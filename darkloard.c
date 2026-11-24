@@ -180,6 +180,13 @@ struct DarkloardScreen
     bool is_dirty;
     bool pending_wrap;
     bool auto_wrap;
+    bool insert_mode; // IRM (CSI 4 h)
+    // Character sets G0/G1 ('B' = ASCII, '0' = DEC special graphics) and
+    // which one is active (SO selects G1, SI selects G0).
+    char charsets[2];
+    int active_charset;
+    // Last printed character, for REP (CSI b).
+    uint32_t last_char;
 };
 
 enum DarkloardFontVariant
@@ -227,6 +234,11 @@ struct DarkloardParser
     bool str_esc_pending;
     uint32_t utf8_codepoint;
     int utf8_remaining;
+    // Which G set "ESC ( x" / "ESC ) x" designates.
+    int charset_target;
+    // Whether the current OSC was terminated by BEL (else ST): replies use
+    // the same terminator.
+    bool osc_bel;
 };
 
 struct DarkloardBuffer
@@ -518,6 +530,9 @@ handle_selection_notify__Darkloard(XSelectionEvent *event);
 
 static void
 handle_property_notify__Darkloard(XPropertyEvent *event);
+
+static void
+send_osc_color__Darkloard(const char *key, uint32_t color);
 
 static void
 update_event_mask__Darkloard(void);
@@ -968,6 +983,11 @@ init__DarkloardScreen(uint32_t rows, uint32_t cols)
     screen.saved_cursor_valid = false;
     screen.pending_wrap = false;
     screen.auto_wrap = true;
+    screen.insert_mode = false;
+    screen.charsets[0] = 'B';
+    screen.charsets[1] = 'B';
+    screen.active_charset = 0;
+    screen.last_char = ' ';
     screen.cells = XMALLOC(rows * sizeof(struct DarkloardCell *));
 
     for (uint32_t i = 0; i < rows; i++) {
@@ -1257,6 +1277,21 @@ put_char__DarkloardScreen(uint32_t codepoint)
         return;
     }
 
+    // DEC special graphics (line drawing), used by ncurses for boxes.
+    if (screen.charsets[screen.active_charset] == '0' && codepoint >= 0x5F &&
+        codepoint <= 0x7E) {
+        static const uint16_t dec_graphics[32] = {
+            0x00A0, 0x25C6, 0x2592, 0x2409, 0x240C, 0x240D, 0x240A, 0x00B0,
+            0x00B1, 0x2424, 0x240B, 0x2518, 0x2510, 0x250C, 0x2514, 0x253C,
+            0x23BA, 0x23BB, 0x2500, 0x23BC, 0x23BD, 0x251C, 0x2524, 0x2534,
+            0x252C, 0x2502, 0x2264, 0x2265, 0x03C0, 0x2260, 0x00A3, 0x00B7,
+        };
+
+        codepoint = dec_graphics[codepoint - 0x5F];
+    }
+
+    screen.last_char = codepoint;
+
     int width = wcwidth((wchar_t)codepoint);
 
     if (width < 0) {
@@ -1295,6 +1330,18 @@ put_char__DarkloardScreen(uint32_t codepoint)
             } else if (screen.cursor.row < screen.rows - 1) {
                 screen.cursor.row++;
             }
+        }
+    }
+
+    if (screen.insert_mode) {
+        // IRM: shift the rest of the line right instead of overwriting.
+        struct DarkloardCell *line = screen.cells[screen.cursor.row];
+        uint32_t w = (uint32_t)width;
+
+        for (uint32_t j = screen.cols - 1;
+             j >= screen.cursor.col + w && j < screen.cols;
+             j--) {
+            line[j] = line[j - w];
         }
     }
 
@@ -1482,7 +1529,12 @@ handle_normal__DarkloardParser(unsigned char c)
 
             break;
         case DARKLOARD_SO:
+            screen.active_charset = 1;
+
+            break;
         case DARKLOARD_SI:
+            screen.active_charset = 0;
+
             break;
         case DARKLOARD_CAN:
         case DARKLOARD_SUB:
@@ -1576,6 +1628,10 @@ handle_esc__DarkloardParser(unsigned char c)
             screen.saved_cursor_valid = false;
             screen.pending_wrap = false;
             screen.auto_wrap = true;
+            screen.insert_mode = false;
+            screen.charsets[0] = 'B';
+            screen.charsets[1] = 'B';
+            screen.active_charset = 0;
             screen.cursor.row = 0;
             screen.cursor.col = 0;
             screen.current_fg = DARKLOARD_DEFAULT_FG;
@@ -1609,6 +1665,7 @@ handle_esc__DarkloardParser(unsigned char c)
             break;
         case '(':
         case ')':
+            parser.charset_target = (c == '(') ? 0 : 1;
             parser.state = DARKLOARD_PARSE_STATE_CHARSET;
 
             break;
@@ -1986,6 +2043,21 @@ handle_csi__DarkloardParser(void)
 
             break;
         }
+        case 'b': {
+            if (!plain) {
+                break;
+            }
+
+            // REP: repeat the last printed character (bounded to a screen).
+            uint32_t n = (uint32_t)CSI_PARAM(0, 1);
+            uint32_t max = screen.rows * screen.cols;
+
+            for (uint32_t k = 0; k < n && k < max; k++) {
+                put_char__DarkloardScreen(screen.last_char);
+            }
+
+            break;
+        }
         case 'c':
             if (!parser.csi.secondary) {
                 write_pty__Darkloard("\033[?62;c", 7);
@@ -2050,6 +2122,15 @@ handle_csi__DarkloardParser(void)
         case 'h':
         case 'l': {
             bool set = parser.csi.final_byte == 'h';
+
+            for (int pi = 0;
+                 !parser.csi.private_mode && !parser.csi.secondary &&
+                 pi < parser.csi.params_len;
+                 pi++) {
+                if (parser.csi.params[pi] == 4) {
+                    screen.insert_mode = set;
+                }
+            }
 
             for (int pi = 0;
                  parser.csi.private_mode && pi < parser.csi.params_len;
@@ -2389,6 +2470,8 @@ void
 handle_osc_byte__DarkloardParser(unsigned char c)
 {
     if (c == DARKLOARD_BEL) {
+        parser.osc_bel = true;
+
         handle_osc__DarkloardParser();
 
         parser.osc_len = 0;
@@ -2404,6 +2487,8 @@ handle_osc_byte__DarkloardParser(unsigned char c)
     }
 
     if (c == '\\' && parser.osc_esc_pending) {
+        parser.osc_bel = false;
+
         handle_osc__DarkloardParser();
 
         parser.osc_len = 0;
@@ -2465,10 +2550,83 @@ handle_osc__DarkloardParser(void)
 
                 break;
             }
+            case 4: {
+                // "4;index;?" (possibly several pairs): palette query.
+                char *p = parser.osc_buf + i + 1;
+
+                while (*p) {
+                    char *end = NULL;
+                    long idx = strtol(p, &end, 10);
+
+                    if (end == p || *end != ';') {
+                        break;
+                    }
+
+                    p = end + 1;
+
+                    if (p[0] == '?' && (p[1] == ';' || p[1] == '\0') &&
+                        idx >= 0 && idx < 256) {
+                        char key[16];
+
+                        snprintf(key, sizeof(key), "4;%ld", idx);
+                        send_osc_color__Darkloard(
+                          key, xterm256_to_rgb__Darkloard((int)idx));
+                    }
+
+                    // Skip to the next pair.
+                    while (*p && *p != ';') {
+                        p++;
+                    }
+
+                    if (*p == ';') {
+                        p++;
+                    }
+                }
+
+                break;
+            }
+            case 10:
+            case 11:
+            case 12: {
+                // "?" asks for the foreground / background / cursor color
+                // (vim, neovim and fish use it to pick a light/dark theme).
+                if (strcmp(parser.osc_buf + i + 1, "?") == 0) {
+                    uint32_t color = cmd == 10   ? DARKLOARD_DEFAULT_FG
+                                     : cmd == 11 ? DARKLOARD_DEFAULT_BG
+                                                 : DARKLOARD_CURSOR_COLOR;
+                    char key[8];
+
+                    snprintf(key, sizeof(key), "%d", cmd);
+                    send_osc_color__Darkloard(key, color);
+                }
+
+                break;
+            }
             default:
                 break;
         }
     }
+}
+
+// Replies "OSC key ; rgb:rrrr/gggg/bbbb" with the query's terminator.
+void
+send_osc_color__Darkloard(const char *key, uint32_t color)
+{
+    unsigned r = (color >> 16) & 0xFF, g = (color >> 8) & 0xFF, b = color & 0xFF;
+    char buf[64];
+    int len = snprintf(buf,
+                       sizeof(buf),
+                       "\033]%s;rgb:%02x%02x/%02x%02x/%02x%02x%s",
+                       key,
+                       r,
+                       r,
+                       g,
+                       g,
+                       b,
+                       b,
+                       parser.osc_bel ? "\a" : "\033\\");
+
+    write_pty__Darkloard(buf, (size_t)len);
 }
 
 void
@@ -2558,6 +2716,8 @@ feed__DarkloardParser(unsigned char c)
 
             break;
         case DARKLOARD_PARSE_STATE_CHARSET:
+            // Only DEC special graphics is special, anything else is ASCII.
+            screen.charsets[parser.charset_target] = (c == '0') ? '0' : 'B';
             parser.state = DARKLOARD_PARSE_STATE_NORMAL;
 
             break;
