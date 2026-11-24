@@ -3843,6 +3843,11 @@ handle_x_events__Darkloard(void)
 
         bool was_dirty = screen.is_dirty;
 
+        // Results of our own XCopyArea: nothing changed.
+        if (event.type == NoExpose || event.type == GraphicsExpose) {
+            continue;
+        }
+
         screen.is_dirty = true;
 
         switch (event.type) {
@@ -4154,6 +4159,9 @@ main()
                                  RGB(0, 0, 0),
                                  RGB(0, 0, 0));
     window_gc = XCreateGC(display, window, 0, NULL);
+    // Otherwise every XCopyArea of the back buffer sends a NoExpose event,
+    // which would trigger another redraw, endlessly.
+    XSetGraphicsExposures(display, window_gc, False);
 
     XStoreName(display, window, "Darkloard");
     update_event_mask__Darkloard();
