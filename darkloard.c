@@ -230,13 +230,15 @@ struct DarkloardBuffer
     size_t cap;
 };
 
+// Selection rows are absolute line numbers (see view_row_to_line__Darkloard)
+// so a selection stays attached to its text while scrolling through history.
 struct DarkloardSelection
 {
     bool active;
     bool selecting;
-    uint32_t start_row;
+    int64_t start_row;
     uint32_t start_col;
-    uint32_t end_row;
+    int64_t end_row;
     uint32_t end_col;
     char *text;
     size_t text_len;
@@ -269,6 +271,9 @@ static struct DarkloardCell **history_lines = NULL;
 static uint32_t *history_line_cols = NULL;
 static int history_head = 0;
 static int history_count = 0;
+// Number of lines that fell off the top of the full history buffer. Used to
+// give every line a stable absolute number.
+static int64_t history_dropped = 0;
 static int scroll_offset = 0;
 static struct DarkloardScreen screen = { 0 };
 static struct DarkloardParser parser = { 0 };
@@ -455,8 +460,17 @@ deinit__DarkloardSelection(void);
 static void
 pixel_to_cell__Darkloard(int px, int py, uint32_t *row, uint32_t *col);
 
+static int64_t
+view_row_to_line__Darkloard(uint32_t row);
+
+static struct DarkloardCell *
+get_line_cells__Darkloard(int64_t line, uint32_t *cols);
+
+static void
+pixel_to_selection__Darkloard(int px, int py, int64_t *line, uint32_t *col);
+
 static bool
-is_selected__DarkloardSelection(uint32_t row, uint32_t col);
+is_selected__DarkloardSelection(int64_t line, uint32_t col);
 
 static void
 build_selection_text__DarkloardSelection(void);
@@ -970,10 +984,21 @@ deinit__DarkloardScreen(void)
 void
 resize__DarkloardScreen(uint32_t rows, uint32_t cols)
 {
-    scroll_offset = 0;
+    // init__DarkloardScreen() resets in_alt_screen, so remember it here.
+    bool was_alt_screen = in_alt_screen;
 
-    if (!in_alt_screen && screen.cells) {
-        for (uint32_t i = 0; i < screen.rows; i++) {
+    scroll_offset = 0;
+    // Line numbers shift when the screen is pushed to history.
+    selection.active = false;
+    selection.selecting = false;
+
+    if (!was_alt_screen && screen.cells) {
+        // Only keep rows up to the cursor: the rest are blank and would just
+        // fill the scrollback with empty lines on every resize.
+        uint32_t last_row =
+          screen.cursor.row < screen.rows ? screen.cursor.row : screen.rows - 1;
+
+        for (uint32_t i = 0; i <= last_row; i++) {
             push_history_line__Darkloard(screen.cells[i], screen.cols);
         }
     }
@@ -981,7 +1006,7 @@ resize__DarkloardScreen(uint32_t rows, uint32_t cols)
     free_cells__DarkloardScreen();
     init__DarkloardScreen(rows, cols);
 
-    if (in_alt_screen) {
+    if (was_alt_screen) {
         struct DarkloardCell **tmp = screen.cells;
         screen.cells = inactive_cells;
         inactive_cells = tmp;
@@ -2267,6 +2292,8 @@ enter_alt_screen__Darkloard(bool save_cursor)
     screen.cells = inactive_cells;
     inactive_cells = tmp;
     in_alt_screen = true;
+    selection.active = false;
+    selection.selecting = false;
     screen.pending_wrap = false;
     screen.cursor.row = 0;
     screen.cursor.col = 0;
@@ -2286,6 +2313,8 @@ leave_alt_screen__Darkloard(bool restore_cursor)
     screen.cells = inactive_cells;
     inactive_cells = tmp;
     in_alt_screen = false;
+    selection.active = false;
+    selection.selecting = false;
 
     if (restore_cursor) {
         screen.pending_wrap = false;
@@ -2381,6 +2410,8 @@ push_history_line__Darkloard(struct DarkloardCell *line, uint32_t cols)
 
     if (history_count < DARKLOARD_HISTORY_LINES) {
         history_count++;
+    } else {
+        history_dropped++;
     }
 }
 
@@ -2398,6 +2429,10 @@ init_history__Darkloard(void)
     history_lines =
       XMALLOC(sizeof(struct DarkloardCell *) * DARKLOARD_HISTORY_LINES);
     history_line_cols = XMALLOC(sizeof(uint32_t) * DARKLOARD_HISTORY_LINES);
+
+    // push_history_line__Darkloard() checks these slots for NULL.
+    memset(history_lines, 0, sizeof(struct DarkloardCell *) * DARKLOARD_HISTORY_LINES);
+    memset(history_line_cols, 0, sizeof(uint32_t) * DARKLOARD_HISTORY_LINES);
 }
 
 struct DarkloardCell *
@@ -2426,6 +2461,7 @@ clear_history__Darkloard(void)
 
     history_head = 0;
     history_count = 0;
+    history_dropped = 0;
     scroll_offset = 0;
     history_lines = NULL;
     history_line_cols = NULL;
@@ -2503,7 +2539,6 @@ draw__Darkloard(void)
     for (uint32_t row = 0; row < screen.rows; row++) {
         struct DarkloardCell *row_cells = NULL;
         uint32_t row_cols = screen.cols;
-        bool from_history = false;
 
         if (scroll_offset > 0) {
             int abs = (int)history_count - scroll_offset + (int)row;
@@ -2513,7 +2548,6 @@ draw__Darkloard(void)
 
                 row_cells = get_history_line__Darkloard(abs);
                 row_cols = hcols < screen.cols ? hcols : screen.cols;
-                from_history = true;
             } else if (abs >= (int)history_count) {
                 uint32_t srow = (uint32_t)(abs - (int)history_count);
 
@@ -2541,7 +2575,8 @@ draw__Darkloard(void)
                 bg = tmp;
             }
 
-            if (!from_history && is_selected__DarkloardSelection(row, col)) {
+            if (is_selected__DarkloardSelection(
+                  view_row_to_line__Darkloard(row), col)) {
                 fg = DARKLOARD_DEFAULT_BG;
                 bg = DARKLOARD_SELECTION_BG;
             }
@@ -2690,18 +2725,64 @@ pixel_to_cell__Darkloard(int px, int py, uint32_t *row, uint32_t *col)
                                         : (uint32_t)c;
 }
 
+// Absolute line number of a visible row: lines are numbered from the oldest
+// line ever pushed to history, followed by the screen rows.
+int64_t
+view_row_to_line__Darkloard(uint32_t row)
+{
+    return history_dropped + history_count - scroll_offset + (int64_t)row;
+}
+
+// Cells of an absolute line (history or screen), or NULL if it no longer
+// exists.
+struct DarkloardCell *
+get_line_cells__Darkloard(int64_t line, uint32_t *cols)
+{
+    int64_t idx = line - history_dropped;
+
+    if (idx < 0) {
+        return NULL;
+    }
+
+    if (idx < history_count) {
+        *cols = get_history_line_cols__Darkloard((int)idx);
+
+        return get_history_line__Darkloard((int)idx);
+    }
+
+    idx -= history_count;
+
+    if (!screen.cells || idx >= screen.rows) {
+        return NULL;
+    }
+
+    *cols = screen.cols;
+
+    return screen.cells[idx];
+}
+
+void
+pixel_to_selection__Darkloard(int px, int py, int64_t *line, uint32_t *col)
+{
+    uint32_t row;
+
+    pixel_to_cell__Darkloard(px, py, &row, col);
+
+    *line = view_row_to_line__Darkloard(row);
+}
+
 bool
-is_selected__DarkloardSelection(uint32_t row, uint32_t col)
+is_selected__DarkloardSelection(int64_t row, uint32_t col)
 {
     if (!selection.active && !selection.selecting) {
         return false;
     }
 
-    uint32_t r1 = selection.start_row, c1 = selection.start_col;
-    uint32_t r2 = selection.end_row, c2 = selection.end_col;
+    int64_t r1 = selection.start_row, r2 = selection.end_row;
+    uint32_t c1 = selection.start_col, c2 = selection.end_col;
 
     if (r1 > r2 || (r1 == r2 && c1 > c2)) {
-        uint32_t tr = r1;
+        int64_t tr = r1;
 
         r1 = r2;
         r2 = tr;
@@ -2739,11 +2820,11 @@ build_selection_text__DarkloardSelection(void)
         return;
     }
 
-    uint32_t r1 = selection.start_row, c1 = selection.start_col;
-    uint32_t r2 = selection.end_row, c2 = selection.end_col;
+    int64_t r1 = selection.start_row, r2 = selection.end_row;
+    uint32_t c1 = selection.start_col, c2 = selection.end_col;
 
     if (r1 > r2 || (r1 == r2 && c1 > c2)) {
-        uint32_t tr = r1;
+        int64_t tr = r1;
 
         r1 = r2;
         r2 = tr;
@@ -2754,46 +2835,57 @@ build_selection_text__DarkloardSelection(void)
         c2 = tc;
     }
 
-    size_t max_size = (size_t)(r2 - r1 + 2) * ((size_t)screen.cols * 4 + 2);
-    char *buf = XMALLOC(max_size);
-    size_t len = 0;
+    struct DarkloardBuffer out = { 0 };
 
-    for (uint32_t row = r1; row <= r2; row++) {
+    for (int64_t row = r1; row <= r2; row++) {
+        uint32_t cols = 0;
+        struct DarkloardCell *cells = get_line_cells__Darkloard(row, &cols);
         uint32_t col_start = (row == r1) ? c1 : 0;
-        uint32_t col_end = (row == r2) ? c2 : screen.cols - 1;
-        // Find last non-space in this row segment to strip trailing whitespace.
-        uint32_t last = col_start;
-        bool has_content = false;
+        uint32_t col_end = (row == r2) ? c2 : cols - 1;
 
-        for (uint32_t c = col_end + 1; c-- > col_start;) {
-            uint32_t cp = screen.cells[row][c].codepoint;
-            if (cp != 0 && cp != ' ') {
-                last = c;
-                has_content = true;
-                break;
+        if (cells && cols > 0 && col_start < cols) {
+            if (col_end >= cols) {
+                col_end = cols - 1;
             }
-        }
 
-        if (has_content) {
-            for (uint32_t c = col_start; c <= last; c++) {
-                uint32_t cp = screen.cells[row][c].codepoint;
+            // Find last non-space in this row segment to strip trailing
+            // whitespace.
+            uint32_t last = col_start;
+            bool has_content = false;
 
-                if (cp == 0) {
-                    cp = ' ';
+            for (uint32_t c = col_end + 1; c-- > col_start;) {
+                uint32_t cp = cells[c].codepoint;
+
+                if (cp != 0 && cp != ' ') {
+                    last = c;
+                    has_content = true;
+                    break;
                 }
+            }
 
-                char utf8[5] = { 0 };
-                int utf8_len = codepoint_to_utf8__Darkloard(cp, utf8);
+            if (has_content) {
+                for (uint32_t c = col_start; c <= last; c++) {
+                    uint32_t cp = cells[c].codepoint;
 
-                memcpy(buf + len, utf8, (size_t)utf8_len);
-                len += (size_t)utf8_len;
+                    if (cp == 0) {
+                        cp = ' ';
+                    }
+
+                    char utf8[5] = { 0 };
+                    int utf8_len = codepoint_to_utf8__Darkloard(cp, utf8);
+
+                    append__DarkloardBuffer(&out, utf8, (size_t)utf8_len);
+                }
             }
         }
 
         if (row < r2) {
-            buf[len++] = '\n';
+            append__DarkloardBuffer(&out, "\n", 1);
         }
     }
+
+    char *buf = out.data;
+    size_t len = out.len;
 
     selection.text = buf;
     selection.text_len = len;
@@ -2889,7 +2981,22 @@ read_selection_property__Darkloard(void)
         }
 
         if (data && nitems > 0 && actual_format == 8 &&
-            actual_type != atom_incr) {
+            actual_type == XA_STRING) {
+            // STRING is Latin-1: convert to UTF-8.
+            for (unsigned long i = 0; i < nitems; i++) {
+                unsigned char c = data[i];
+
+                if (c < 0x80) {
+                    append__DarkloardBuffer(&paste_in, (char *)&c, 1);
+                } else {
+                    char utf8[2] = { (char)(0xC0 | (c >> 6)),
+                                     (char)(0x80 | (c & 0x3F)) };
+
+                    append__DarkloardBuffer(&paste_in, utf8, 2);
+                }
+            }
+        } else if (data && nitems > 0 && actual_format == 8 &&
+                   actual_type != atom_incr) {
             append__DarkloardBuffer(&paste_in, (char *)data, nitems);
         }
 
@@ -2943,6 +3050,16 @@ void
 handle_selection_notify__Darkloard(XSelectionEvent *event)
 {
     if (event->property == None) {
+        // The owner can't provide UTF8_STRING: fall back to plain STRING.
+        if (event->target == atom_utf8_string) {
+            XConvertSelection(display,
+                              event->selection,
+                              XA_STRING,
+                              atom_xsel_data,
+                              window,
+                              CurrentTime);
+        }
+
         return;
     }
 
@@ -2990,7 +3107,7 @@ handle_button_press__Darkloard(XButtonEvent *event)
 
         selection.selecting = true;
 
-        pixel_to_cell__Darkloard(
+        pixel_to_selection__Darkloard(
           event->x, event->y, &selection.start_row, &selection.start_col);
 
         selection.end_row = selection.start_row;
@@ -3033,7 +3150,7 @@ handle_button_release__Darkloard(XButtonEvent *event)
 
     selection.selecting = false;
 
-    pixel_to_cell__Darkloard(
+    pixel_to_selection__Darkloard(
       event->x, event->y, &selection.end_row, &selection.end_col);
 
     if (selection.start_row == selection.end_row &&
@@ -3054,7 +3171,7 @@ handle_motion__Darkloard(XMotionEvent *event)
         return;
     }
 
-    pixel_to_cell__Darkloard(
+    pixel_to_selection__Darkloard(
       event->x, event->y, &selection.end_row, &selection.end_col);
 }
 
@@ -3088,8 +3205,6 @@ handle_keypress__Darkloard(XKeyEvent *event)
         }
     }
 
-    scroll_offset = 0;
-
     if ((event->state & ControlMask) && (event->state & ShiftMask)) {
         switch (keysym) {
             case XK_c:
@@ -3108,6 +3223,8 @@ handle_keypress__Darkloard(XKeyEvent *event)
                 return;
             case XK_v:
             case XK_V:
+                scroll_offset = 0;
+
                 request_paste__Darkloard(atom_clipboard);
 
                 return;
@@ -3142,6 +3259,14 @@ handle_keypress__Darkloard(XKeyEvent *event)
                 break;
         }
     }
+
+    // Pressing a lone modifier (Shift, Ctrl, ...) must not leave scrollback.
+    if (IsModifierKey(keysym)) {
+        return;
+    }
+
+    // Typing returns the view to the bottom.
+    scroll_offset = 0;
 
     if (len > 0) {
         write_pty__Darkloard(buf, (size_t)len);
