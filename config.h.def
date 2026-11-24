@@ -15,6 +15,10 @@
 #define DARKLOARD_DEFAULT_FG RGB(255, 255, 255)
 #define DARKLOARD_DEFAULT_BG RGB(0, 0, 0)
 #define DARKLOARD_CURSOR_COLOR RGB(255, 255, 255)
+// Whether the default cursor blinks (applications can still choose with
+// CSI Ps SP q), and the blink period.
+#define DARKLOARD_CURSOR_BLINK false
+#define DARKLOARD_CURSOR_BLINK_MS 500
 #define DARKLOARD_SELECTION_BG RGB(74, 144, 217)
 
 // ANSI color palette (colors 0-15)

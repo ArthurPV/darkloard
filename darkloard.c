@@ -26,6 +26,7 @@
 #include <fcntl.h>
 #include <locale.h>
 #include <poll.h>
+#include <time.h>
 #include <pwd.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -68,6 +69,17 @@
 #endif /* defined(__NetBSD__) */
 
 #include "config.h"
+
+// Defaults for options added after config.h was created (config.h is only
+// copied from config.h.def when missing).
+#ifndef DARKLOARD_CURSOR_BLINK
+// Whether the default cursor (shape 0, also after a reset) blinks.
+#define DARKLOARD_CURSOR_BLINK false
+#endif
+
+#ifndef DARKLOARD_CURSOR_BLINK_MS
+#define DARKLOARD_CURSOR_BLINK_MS 500
+#endif
 
 #define LOG_ERROR(fmt, ...) fprintf(stderr, "Error: " fmt "\n", ##__VA_ARGS__);
 #define XMALLOC(size) xmalloc__Darkloard(size)
@@ -325,6 +337,12 @@ enum DarkloardCursorShape
 };
 
 static enum DarkloardCursorShape cursor_shape = DARKLOARD_CURSOR_BLOCK;
+// Blinking (DECSCUSR odd shapes, or mode ?12). cursor_blink_on is the
+// current phase; blinking pauses while the window is unfocused.
+static bool cursor_blink = DARKLOARD_CURSOR_BLINK;
+static bool cursor_blink_on = true;
+static int64_t cursor_blink_last_ms = 0;
+static bool window_focused = true;
 
 // Mouse reporting (xterm protocol), set by "CSI ? <mode> h/l".
 enum DarkloardMouseMode
@@ -550,6 +568,12 @@ send_osc_color__Darkloard(const char *key, uint32_t color);
 
 static void
 handle_osc52__Darkloard(const char *args);
+
+static int64_t
+now_ms__Darkloard(void);
+
+static void
+reset_cursor_blink__Darkloard(void);
 
 static void
 update_event_mask__Darkloard(void);
@@ -1637,6 +1661,7 @@ handle_esc__DarkloardParser(unsigned char c)
             bracketed_paste = false;
             focus_events = false;
             cursor_shape = DARKLOARD_CURSOR_BLOCK;
+            cursor_blink = DARKLOARD_CURSOR_BLINK;
             mouse_mode = DARKLOARD_MOUSE_NONE;
             mouse_sgr = false;
             mouse_urxvt = false;
@@ -2110,6 +2135,11 @@ handle_csi__DarkloardParser(void)
                 cursor_shape = shape >= 5   ? DARKLOARD_CURSOR_BAR
                                : shape >= 3 ? DARKLOARD_CURSOR_UNDERLINE
                                             : DARKLOARD_CURSOR_BLOCK;
+                // 1, 3, 5 blink; 2, 4, 6 are steady; 0 is the default.
+                cursor_blink =
+                  shape == 0 ? DARKLOARD_CURSOR_BLINK : (shape % 2 == 1);
+
+                reset_cursor_blink__Darkloard();
             }
 
             break;
@@ -2177,6 +2207,12 @@ handle_csi__DarkloardParser(void)
                         if (!set) {
                             screen.pending_wrap = false;
                         }
+
+                        break;
+                    case 12:
+                        cursor_blink = set;
+
+                        reset_cursor_blink__Darkloard();
 
                         break;
                     case 25:
@@ -2883,6 +2919,8 @@ feed__DarkloardParser(unsigned char c)
 void
 parse__Darkloard(struct DarkloardMessage *message)
 {
+    reset_cursor_blink__Darkloard();
+
     for (size_t i = 0; i < message->buffer_len; i++) {
         feed__DarkloardParser((unsigned char)message->buffer[i]);
     }
@@ -3236,7 +3274,9 @@ draw__Darkloard(void)
         }
     }
 
-    if (scroll_offset == 0 && screen.cursor.visible) {
+    bool blink_hidden = cursor_blink && window_focused && !cursor_blink_on;
+
+    if (scroll_offset == 0 && screen.cursor.visible && !blink_hidden) {
         int cx = DARKLOARD_MARGIN_LEFT + (int)screen.cursor.col * cell_w;
         int cy = DARKLOARD_MARGIN_TOP + (int)screen.cursor.row * cell_h;
 
@@ -4105,6 +4145,8 @@ handle_keypress__Darkloard(XKeyEvent *event)
     // Typing returns the view to the bottom.
     scroll_offset = 0;
 
+    reset_cursor_blink__Darkloard();
+
     if (len > 0) {
         write_pty__Darkloard(buf, (size_t)len);
 
@@ -4222,12 +4264,19 @@ handle_x_events__Darkloard(void)
 
                 break;
             case FocusIn:
+                window_focused = true;
+
+                reset_cursor_blink__Darkloard();
+
                 if (focus_events) {
                     write_pty__Darkloard("\033[I", 3);
                 }
 
                 break;
             case FocusOut:
+                // Stop blinking (cursor stays visible) while unfocused.
+                window_focused = false;
+
                 if (focus_events) {
                     write_pty__Darkloard("\033[O", 3);
                 }
@@ -4299,6 +4348,29 @@ handle_pty_events__Darkloard(void)
     return is_terminal_alive__Darkloard();
 }
 
+int64_t
+now_ms__Darkloard(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+// Show the cursor and restart the blink period (on input / output, so the
+// cursor doesn't disappear while typing).
+void
+reset_cursor_blink__Darkloard(void)
+{
+    if (!cursor_blink_on) {
+        screen.is_dirty = true;
+    }
+
+    cursor_blink_on = true;
+    cursor_blink_last_ms = now_ms__Darkloard();
+}
+
 void
 poll__Darkloard(void)
 {
@@ -4309,7 +4381,28 @@ poll__Darkloard(void)
     while (is_terminal_alive__Darkloard() && running) {
         fds[1].events = POLLIN | (pty_out.len > 0 ? POLLOUT : 0);
 
-        int ret = poll(fds, FDS_LEN, -1);
+        // Only wake up for blinking when a blinking cursor is shown.
+        int timeout = -1;
+        bool blinking = cursor_blink && window_focused &&
+                        screen.cursor.visible && scroll_offset == 0;
+
+        if (blinking) {
+            int64_t elapsed = now_ms__Darkloard() - cursor_blink_last_ms;
+
+            if (elapsed >= DARKLOARD_CURSOR_BLINK_MS) {
+                cursor_blink_on = !cursor_blink_on;
+                cursor_blink_last_ms = now_ms__Darkloard();
+                screen.is_dirty = true;
+
+                draw__Darkloard();
+
+                elapsed = 0;
+            }
+
+            timeout = (int)(DARKLOARD_CURSOR_BLINK_MS - elapsed);
+        }
+
+        int ret = poll(fds, FDS_LEN, timeout);
 
         if (ret > 0) {
             if (fds[0].revents & POLLIN) {
