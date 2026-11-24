@@ -177,6 +177,17 @@ struct DarkloardCell
     uint16_t combining;
 };
 
+// Colors stored in cells and in the current SGR state are references,
+// resolved when drawing, so changing the palette (OSC 4) or the default
+// colors (OSC 10 / 11) also changes text already on screen:
+// - 0x00RRGGBB: direct RGB (truecolor),
+// - DARKLOARD_PALETTE_COLOR(n): palette entry n (0-255),
+// - DARKLOARD_DEFAULT_FG_COLOR / DARKLOARD_DEFAULT_BG_COLOR.
+#define DARKLOARD_COLOR_KIND(c) ((c) >> 24)
+#define DARKLOARD_PALETTE_COLOR(n) ((1u << 24) | ((uint32_t)(n) & 0xFF))
+#define DARKLOARD_DEFAULT_FG_COLOR (2u << 24)
+#define DARKLOARD_DEFAULT_BG_COLOR (3u << 24)
+
 // Interned sequences of combining marks, shared by all cells.
 #define DARKLOARD_MAX_COMBINING 4
 
@@ -344,6 +355,13 @@ struct DarkloardSavedCursor
 };
 
 static struct DarkloardSavedCursor saved_cursors[2] = { { 0 } };
+
+// Current colors, changed by OSC 4 / 10 / 11 / 12 and reset by OSC 104 /
+// 110 / 111 / 112 (initialized from config.h).
+static uint32_t palette[256];
+static uint32_t default_fg = DARKLOARD_DEFAULT_FG;
+static uint32_t default_bg = DARKLOARD_DEFAULT_BG;
+static uint32_t cursor_color = DARKLOARD_CURSOR_COLOR;
 
 // Entry 0 is unused ("no marks"). Entries are never removed: the number of
 // distinct mark sequences seen in a session is small.
@@ -589,6 +607,15 @@ save_cursor__Darkloard(void);
 
 static uint16_t
 add_combining__Darkloard(uint16_t id, uint32_t mark);
+
+static void
+reset_palette__Darkloard(int index);
+
+static bool
+parse_color__Darkloard(const char *spec, size_t len, uint32_t *rgb);
+
+static uint32_t
+resolve_color__Darkloard(uint32_t color);
 
 static const struct DarkloardCombining *
 get_combining__Darkloard(uint16_t id);
@@ -1146,8 +1173,8 @@ init__DarkloardScreen(uint32_t rows, uint32_t cols)
 {
     screen.rows = rows;
     screen.cols = cols;
-    screen.current_fg = DARKLOARD_DEFAULT_FG;
-    screen.current_bg = DARKLOARD_DEFAULT_BG;
+    screen.current_fg = DARKLOARD_DEFAULT_FG_COLOR;
+    screen.current_bg = DARKLOARD_DEFAULT_BG_COLOR;
     screen.current_attrs = 0;
     screen.cursor.row = 0;
     screen.cursor.col = 0;
@@ -1175,8 +1202,8 @@ init__DarkloardScreen(uint32_t rows, uint32_t cols)
         for (uint32_t j = 0; j < cols; j++) {
             screen.cells[i][j] =
               (struct DarkloardCell){ .codepoint = ' ',
-                                      .fg = DARKLOARD_DEFAULT_FG,
-                                      .bg = DARKLOARD_DEFAULT_BG,
+                                      .fg = DARKLOARD_DEFAULT_FG_COLOR,
+                                      .bg = DARKLOARD_DEFAULT_BG_COLOR,
                                       .attrs = 0 };
         }
     }
@@ -1190,8 +1217,8 @@ init__DarkloardScreen(uint32_t rows, uint32_t cols)
         for (uint32_t j = 0; j < cols; j++) {
             inactive_cells[i][j] =
               (struct DarkloardCell){ .codepoint = ' ',
-                                      .fg = DARKLOARD_DEFAULT_FG,
-                                      .bg = DARKLOARD_DEFAULT_BG,
+                                      .fg = DARKLOARD_DEFAULT_FG_COLOR,
+                                      .bg = DARKLOARD_DEFAULT_BG_COLOR,
                                       .attrs = 0 };
         }
     }
@@ -1238,8 +1265,8 @@ resize_cells__DarkloardScreen(struct DarkloardCell **old,
                               uint32_t cols)
 {
     struct DarkloardCell blank = { .codepoint = ' ',
-                                   .fg = DARKLOARD_DEFAULT_FG,
-                                   .bg = DARKLOARD_DEFAULT_BG,
+                                   .fg = DARKLOARD_DEFAULT_FG_COLOR,
+                                   .bg = DARKLOARD_DEFAULT_BG_COLOR,
                                    .attrs = 0 };
     struct DarkloardCell **cells = XMALLOC(rows * sizeof(struct DarkloardCell *));
 
@@ -1925,6 +1952,10 @@ handle_esc__DarkloardParser(unsigned char c)
             focus_events = false;
             cursor_shape = DARKLOARD_CURSOR_BLOCK;
             cursor_shape_param = 0;
+            reset_palette__Darkloard(-1);
+            default_fg = DARKLOARD_DEFAULT_FG;
+            default_bg = DARKLOARD_DEFAULT_BG;
+            cursor_color = DARKLOARD_CURSOR_COLOR;
             cursor_blink = DARKLOARD_CURSOR_BLINK;
             sync_output = false;
             mouse_mode = DARKLOARD_MOUSE_NONE;
@@ -1945,8 +1976,8 @@ handle_esc__DarkloardParser(unsigned char c)
             resize_tabs__DarkloardScreen(0, screen.cols);
             screen.cursor.row = 0;
             screen.cursor.col = 0;
-            screen.current_fg = DARKLOARD_DEFAULT_FG;
-            screen.current_bg = DARKLOARD_DEFAULT_BG;
+            screen.current_fg = DARKLOARD_DEFAULT_FG_COLOR;
+            screen.current_bg = DARKLOARD_DEFAULT_BG_COLOR;
             screen.current_attrs = 0;
             screen.scroll_region.top = 0;
             screen.scroll_region.bottom = screen.rows - 1;
@@ -2673,15 +2704,6 @@ handle_csi__DarkloardParser(void)
 void
 handle_sgr__DarkloardParser(void)
 {
-    static const uint32_t ansi_colors[16] = {
-        DARKLOARD_COLOR_0,  DARKLOARD_COLOR_1,  DARKLOARD_COLOR_2,
-        DARKLOARD_COLOR_3,  DARKLOARD_COLOR_4,  DARKLOARD_COLOR_5,
-        DARKLOARD_COLOR_6,  DARKLOARD_COLOR_7,  DARKLOARD_COLOR_8,
-        DARKLOARD_COLOR_9,  DARKLOARD_COLOR_10, DARKLOARD_COLOR_11,
-        DARKLOARD_COLOR_12, DARKLOARD_COLOR_13, DARKLOARD_COLOR_14,
-        DARKLOARD_COLOR_15,
-    };
-
     int params_len = parser.csi.params_len == 0 ? 1 : parser.csi.params_len;
 
     for (int i = 0; i < params_len; i++) {
@@ -2712,8 +2734,8 @@ handle_sgr__DarkloardParser(void)
                 bool ok = false;
 
                 if (sub[0] == 5 && sub_count >= 2) {
-                    color = xterm256_to_rgb__Darkloard(sub[1]);
-                    ok = true;
+                    color = DARKLOARD_PALETTE_COLOR(sub[1]);
+                    ok = sub[1] >= 0 && sub[1] < 256;
                 } else if (sub[0] == 2 && sub_count >= 4) {
                     // 38:2:r:g:b or 38:2:colorspace:r:g:b
                     const int *rgb = sub_count >= 5 ? &sub[2] : &sub[1];
@@ -2735,8 +2757,8 @@ handle_sgr__DarkloardParser(void)
 
         switch (p) {
             case 0:
-                screen.current_fg = DARKLOARD_DEFAULT_FG;
-                screen.current_bg = DARKLOARD_DEFAULT_BG;
+                screen.current_fg = DARKLOARD_DEFAULT_FG_COLOR;
+                screen.current_bg = DARKLOARD_DEFAULT_BG_COLOR;
                 screen.current_attrs = 0;
 
                 break;
@@ -2809,13 +2831,13 @@ handle_sgr__DarkloardParser(void)
             case 35:
             case 36:
             case 37:
-                screen.current_fg = ansi_colors[p - 30];
+                screen.current_fg = DARKLOARD_PALETTE_COLOR(p - 30);
 
                 break;
             case 38:
                 if (i + 2 < params_len && parser.csi.params[i + 1] == 5) {
                     screen.current_fg =
-                      xterm256_to_rgb__Darkloard(parser.csi.params[i + 2]);
+                      DARKLOARD_PALETTE_COLOR(parser.csi.params[i + 2]);
                     i += 2;
                 } else if (i + 4 < params_len &&
                            parser.csi.params[i + 1] == 2) {
@@ -2827,7 +2849,7 @@ handle_sgr__DarkloardParser(void)
 
                 break;
             case 39:
-                screen.current_fg = DARKLOARD_DEFAULT_FG;
+                screen.current_fg = DARKLOARD_DEFAULT_FG_COLOR;
 
                 break;
             case 40:
@@ -2838,13 +2860,13 @@ handle_sgr__DarkloardParser(void)
             case 45:
             case 46:
             case 47:
-                screen.current_bg = ansi_colors[p - 40];
+                screen.current_bg = DARKLOARD_PALETTE_COLOR(p - 40);
 
                 break;
             case 48:
                 if (i + 2 < params_len && parser.csi.params[i + 1] == 5) {
                     screen.current_bg =
-                      xterm256_to_rgb__Darkloard(parser.csi.params[i + 2]);
+                      DARKLOARD_PALETTE_COLOR(parser.csi.params[i + 2]);
                     i += 2;
                 } else if (i + 4 < params_len &&
                            parser.csi.params[i + 1] == 2) {
@@ -2856,7 +2878,7 @@ handle_sgr__DarkloardParser(void)
 
                 break;
             case 49:
-                screen.current_bg = DARKLOARD_DEFAULT_BG;
+                screen.current_bg = DARKLOARD_DEFAULT_BG_COLOR;
 
                 break;
             case 58:
@@ -2878,7 +2900,7 @@ handle_sgr__DarkloardParser(void)
             case 95:
             case 96:
             case 97:
-                screen.current_fg = ansi_colors[p - 90 + 8];
+                screen.current_fg = DARKLOARD_PALETTE_COLOR(p - 90 + 8);
 
                 break;
             case 100:
@@ -2889,7 +2911,7 @@ handle_sgr__DarkloardParser(void)
             case 105:
             case 106:
             case 107:
-                screen.current_bg = ansi_colors[p - 100 + 8];
+                screen.current_bg = DARKLOARD_PALETTE_COLOR(p - 100 + 8);
 
                 break;
             default:
@@ -2975,7 +2997,14 @@ handle_osc__DarkloardParser(void)
         i++;
     }
 
-    if (i < parser.osc_len && parser.osc_buf[i] == ';') {
+    // Arguments after "cmd;", or "" for commands without any (OSC 104...).
+    bool has_args = i < parser.osc_len && parser.osc_buf[i] == ';';
+
+    if (has_args || i == parser.osc_len) {
+        if (!has_args) {
+            i--; // so that parser.osc_buf + i + 1 is the (empty) end
+        }
+
         switch (cmd) {
             case 0:
             case 2: {
@@ -2995,7 +3024,8 @@ handle_osc__DarkloardParser(void)
                 break;
             }
             case 4: {
-                // "4;index;?" (possibly several pairs): palette query.
+                // "4;index;spec" pairs: spec "?" queries the palette entry,
+                // anything else sets it.
                 char *p = parser.osc_buf + i + 1;
 
                 while (*p) {
@@ -3008,13 +3038,20 @@ handle_osc__DarkloardParser(void)
 
                     p = end + 1;
 
-                    if (p[0] == '?' && (p[1] == ';' || p[1] == '\0') &&
-                        idx >= 0 && idx < 256) {
+                    char *spec_end = strchr(p, ';');
+                    size_t spec_len = spec_end ? (size_t)(spec_end - p) : strlen(p);
+                    uint32_t rgb;
+
+                    if (idx < 0 || idx > 255) {
+                        // Out of range: skip the pair.
+                    } else if (spec_len == 1 && p[0] == '?') {
                         char key[16];
 
                         snprintf(key, sizeof(key), "4;%ld", idx);
-                        send_osc_color__Darkloard(
-                          key, xterm256_to_rgb__Darkloard((int)idx));
+                        send_osc_color__Darkloard(key, palette[idx]);
+                    } else if (parse_color__Darkloard(p, spec_len, &rgb)) {
+                        palette[idx] = rgb;
+                        screen.is_dirty = true;
                     }
 
                     // Skip to the next pair.
@@ -3036,20 +3073,81 @@ handle_osc__DarkloardParser(void)
             case 10:
             case 11:
             case 12: {
-                // "?" asks for the foreground / background / cursor color
-                // (vim, neovim and fish use it to pick a light/dark theme).
-                if (strcmp(parser.osc_buf + i + 1, "?") == 0) {
-                    uint32_t color = cmd == 10   ? DARKLOARD_DEFAULT_FG
-                                     : cmd == 11 ? DARKLOARD_DEFAULT_BG
-                                                 : DARKLOARD_CURSOR_COLOR;
-                    char key[8];
+                // Foreground / background / cursor color: "?" queries it
+                // (vim, neovim and fish use it to pick a light/dark theme),
+                // anything else sets it. Like xterm, more specs set the
+                // following colors ("10;fg;bg").
+                char *p = parser.osc_buf + i + 1;
 
-                    snprintf(key, sizeof(key), "%d", cmd);
-                    send_osc_color__Darkloard(key, color);
+                for (int target = cmd; target <= 12 && *p; target++) {
+                    char *spec_end = strchr(p, ';');
+                    size_t spec_len = spec_end ? (size_t)(spec_end - p) : strlen(p);
+                    uint32_t *color = target == 10   ? &default_fg
+                                      : target == 11 ? &default_bg
+                                                     : &cursor_color;
+                    uint32_t rgb;
+
+                    if (spec_len == 1 && p[0] == '?') {
+                        char key[8];
+
+                        snprintf(key, sizeof(key), "%d", target);
+                        send_osc_color__Darkloard(key, *color);
+                    } else if (parse_color__Darkloard(p, spec_len, &rgb)) {
+                        *color = rgb;
+                        screen.is_dirty = true;
+                    }
+
+                    if (!spec_end) {
+                        break;
+                    }
+
+                    p = spec_end + 1;
                 }
 
                 break;
             }
+            case 104: {
+                // Reset palette entries: all, or the listed indexes.
+                char *p = parser.osc_buf + i + 1;
+
+                if (*p == '\0') {
+                    reset_palette__Darkloard(-1);
+                }
+
+                while (*p) {
+                    char *end = NULL;
+                    long idx = strtol(p, &end, 10);
+
+                    if (end == p) {
+                        break;
+                    }
+
+                    if (idx >= 0 && idx < 256) {
+                        reset_palette__Darkloard((int)idx);
+                    }
+
+                    p = *end == ';' ? end + 1 : end;
+                }
+
+                screen.is_dirty = true;
+
+                break;
+            }
+            case 110:
+                default_fg = DARKLOARD_DEFAULT_FG;
+                screen.is_dirty = true;
+
+                break;
+            case 111:
+                default_bg = DARKLOARD_DEFAULT_BG;
+                screen.is_dirty = true;
+
+                break;
+            case 112:
+                cursor_color = DARKLOARD_CURSOR_COLOR;
+                screen.is_dirty = true;
+
+                break;
             default:
                 break;
         }
@@ -3354,26 +3452,35 @@ handle_decrqss__Darkloard(const char *setting)
                        (a & DARKLOARD_ATTR_INVISIBLE) ? ";8" : "",
                        (a & DARKLOARD_ATTR_STRIKE) ? ";9" : "");
 
-        if (screen.current_fg != DARKLOARD_DEFAULT_FG) {
-            uint32_t c = screen.current_fg;
+        for (int layer = 0; layer < 2; layer++) {
+            uint32_t c = layer == 0 ? screen.current_fg : screen.current_bg;
+            int base = layer == 0 ? 30 : 40;
 
-            len += snprintf(value + len,
-                            sizeof(value) - (size_t)len,
-                            ";38;2;%u;%u;%u",
-                            (c >> 16) & 0xFF,
-                            (c >> 8) & 0xFF,
-                            c & 0xFF);
-        }
+            if (DARKLOARD_COLOR_KIND(c) == 1) {
+                uint32_t n = c & 0xFF;
 
-        if (screen.current_bg != DARKLOARD_DEFAULT_BG) {
-            uint32_t c = screen.current_bg;
-
-            len += snprintf(value + len,
-                            sizeof(value) - (size_t)len,
-                            ";48;2;%u;%u;%u",
-                            (c >> 16) & 0xFF,
-                            (c >> 8) & 0xFF,
-                            c & 0xFF);
+                len += n < 8    ? snprintf(value + len,
+                                        sizeof(value) - (size_t)len,
+                                        ";%u",
+                                        base + n)
+                       : n < 16 ? snprintf(value + len,
+                                           sizeof(value) - (size_t)len,
+                                           ";%u",
+                                           base + 60 + n - 8)
+                                : snprintf(value + len,
+                                           sizeof(value) - (size_t)len,
+                                           ";%d;5;%u",
+                                           base + 8,
+                                           n);
+            } else if (DARKLOARD_COLOR_KIND(c) == 0) {
+                len += snprintf(value + len,
+                                sizeof(value) - (size_t)len,
+                                ";%d;2;%u;%u;%u",
+                                base + 8,
+                                (c >> 16) & 0xFF,
+                                (c >> 8) & 0xFF,
+                                c & 0xFF);
+            }
         }
     } else if (strcmp(setting, "r") == 0) {
         len = snprintf(value,
@@ -3433,6 +3540,57 @@ handle_str_skip__DarkloardParser(unsigned char c)
     }
 
     parser.str_esc_pending = false;
+}
+
+// Parses an X color spec ("rgb:rr/gg/bb", "#rrggbb", "red"...) of `len`
+// bytes. Returns false if it isn't a valid color.
+static bool
+parse_color__Darkloard(const char *spec, size_t len, uint32_t *rgb)
+{
+    char buf[64];
+    XColor color;
+
+    if (len == 0 || len >= sizeof(buf)) {
+        return false;
+    }
+
+    memcpy(buf, spec, len);
+    buf[len] = '\0';
+
+    if (!XParseColor(display, colormap, buf, &color)) {
+        return false;
+    }
+
+    *rgb = RGB(color.red >> 8, color.green >> 8, color.blue >> 8);
+
+    return true;
+}
+
+// Restores palette entry `index` (or all of them when -1) to the default.
+void
+reset_palette__Darkloard(int index)
+{
+    for (int i = 0; i < 256; i++) {
+        if (index < 0 || i == index) {
+            palette[i] = xterm256_to_rgb__Darkloard(i);
+        }
+    }
+}
+
+// Color reference (see DARKLOARD_COLOR_KIND) to RGB.
+uint32_t
+resolve_color__Darkloard(uint32_t color)
+{
+    switch (DARKLOARD_COLOR_KIND(color)) {
+        case 1:
+            return palette[color & 0xFF];
+        case 2:
+            return default_fg;
+        case 3:
+            return default_bg;
+        default:
+            return color;
+    }
 }
 
 uint32_t
@@ -3600,8 +3758,8 @@ restore_cursor__Darkloard(void)
         *saved = (struct DarkloardSavedCursor){
             .row = 0,
             .col = 0,
-            .fg = DARKLOARD_DEFAULT_FG,
-            .bg = DARKLOARD_DEFAULT_BG,
+            .fg = DARKLOARD_DEFAULT_FG_COLOR,
+            .bg = DARKLOARD_DEFAULT_BG_COLOR,
             .charsets = { 'B', 'B' },
         };
     }
@@ -3879,7 +4037,7 @@ draw__Darkloard(void)
         sync_output = false;
     }
 
-    XSetForeground(display, window_gc, DARKLOARD_DEFAULT_BG);
+    XSetForeground(display, window_gc, default_bg);
     XFillRectangle(display,
                    back_buffer,
                    window_gc,
@@ -3933,14 +4091,17 @@ draw__Darkloard(void)
 
             if (is_selected__DarkloardSelection(
                   view_row_to_line__Darkloard(row), col)) {
-                fg = DARKLOARD_DEFAULT_BG;
+                fg = DARKLOARD_DEFAULT_BG_COLOR;
                 bg = DARKLOARD_SELECTION_BG;
             }
+
+            fg = resolve_color__Darkloard(fg);
+            bg = resolve_color__Darkloard(bg);
 
             int x = DARKLOARD_MARGIN_LEFT + (int)col * cell_w;
             int y = DARKLOARD_MARGIN_TOP + (int)row * cell_h;
 
-            if (bg != DARKLOARD_DEFAULT_BG) {
+            if (bg != default_bg) {
                 XSetForeground(display, window_gc, bg);
                 XFillRectangle(display,
                                back_buffer,
@@ -3970,7 +4131,7 @@ draw__Darkloard(void)
         int cx = DARKLOARD_MARGIN_LEFT + (int)screen.cursor.col * cell_w;
         int cy = DARKLOARD_MARGIN_TOP + (int)screen.cursor.row * cell_h;
 
-        XSetForeground(display, window_gc, DARKLOARD_CURSOR_COLOR);
+        XSetForeground(display, window_gc, cursor_color);
 
         if (cursor_shape == DARKLOARD_CURSOR_UNDERLINE) {
             int h = cell_h / 10 > 2 ? cell_h / 10 : 2;
@@ -4007,7 +4168,7 @@ draw__Darkloard(void)
                 draw_glyph__Darkloard(draw,
                                       cur_cell->codepoint,
                                       cur_cell->combining,
-                                      DARKLOARD_DEFAULT_BG,
+                                      default_bg,
                                       cur_cell->attrs,
                                       cell_w,
                                       cx,
@@ -5655,6 +5816,7 @@ int
 main()
 {
     setlocale(LC_ALL, "");
+    reset_palette__Darkloard(-1);
 
     if (!(display = XOpenDisplay(NULL))) {
         LOG_ERROR("failed to open display\n");
