@@ -354,6 +354,13 @@ static bool cursor_blink_on = true;
 static int64_t cursor_blink_last_ms = 0;
 static bool window_focused = true;
 
+// Synchronized output (mode ?2026): drawing is suspended while an
+// application updates the screen, then the whole frame is drawn at once.
+// Drawn anyway after DARKLOARD_SYNC_TIMEOUT_MS in case the end never comes.
+static bool sync_output = false;
+static int64_t sync_output_start_ms = 0;
+#define DARKLOARD_SYNC_TIMEOUT_MS 150
+
 // Pointer position while dragging a selection, for auto-scrolling when it
 // is above / below the text area.
 static int drag_x = 0;
@@ -594,6 +601,12 @@ handle_osc52__Darkloard(const char *args);
 
 static int64_t
 now_ms__Darkloard(void);
+
+static int
+private_mode_state__Darkloard(int mode);
+
+static int
+ansi_mode_state__Darkloard(int mode);
 
 static void
 reset_cursor_blink__Darkloard(void);
@@ -1700,6 +1713,7 @@ handle_esc__DarkloardParser(unsigned char c)
             focus_events = false;
             cursor_shape = DARKLOARD_CURSOR_BLOCK;
             cursor_blink = DARKLOARD_CURSOR_BLINK;
+            sync_output = false;
             mouse_mode = DARKLOARD_MOUSE_NONE;
             mouse_sgr = false;
             mouse_urxvt = false;
@@ -2125,6 +2139,27 @@ handle_csi__DarkloardParser(void)
 
             break;
         }
+        case 'p':
+            // DECRQM: "CSI ? Ps $ p" / "CSI Ps $ p" ask whether a mode is
+            // supported and set. Applications use it to detect features
+            // (e.g. synchronized output) before using them.
+            if (parser.csi.intermediate == '$' && !parser.csi.secondary) {
+                int mode = parser.csi.params_len > 0 ? parser.csi.params[0] : 0;
+                int state = parser.csi.private_mode
+                              ? private_mode_state__Darkloard(mode)
+                              : ansi_mode_state__Darkloard(mode);
+                char reply[48];
+                int len = snprintf(reply,
+                                   sizeof(reply),
+                                   "\033[%s%d;%d$y",
+                                   parser.csi.private_mode ? "?" : "",
+                                   mode,
+                                   state);
+
+                write_pty__Darkloard(reply, (size_t)len);
+            }
+
+            break;
         case 'b': {
             if (!plain) {
                 break;
@@ -2301,6 +2336,14 @@ handle_csi__DarkloardParser(void)
                         } else {
                             leave_alt_screen__Darkloard(true);
                         }
+
+                        break;
+                    case 2026:
+                        if (set && !sync_output) {
+                            sync_output_start_ms = now_ms__Darkloard();
+                        }
+
+                        sync_output = set;
 
                         break;
                     case 2004:
@@ -3231,6 +3274,15 @@ draw__Darkloard(void)
 {
     if (!screen.is_dirty || !screen.cells || !back_buffer) {
         return;
+    }
+
+    if (sync_output) {
+        if (now_ms__Darkloard() - sync_output_start_ms <
+            DARKLOARD_SYNC_TIMEOUT_MS) {
+            return; // stays dirty, drawn when the frame is complete
+        }
+
+        sync_output = false;
     }
 
     XSetForeground(display, window_gc, DARKLOARD_DEFAULT_BG);
@@ -4594,6 +4646,61 @@ autoscroll__Darkloard(void)
     }
 }
 
+// DECRPM states: 0 = not recognized, 1 = set, 2 = reset,
+// 3 = permanently set, 4 = permanently reset.
+#define DECRPM(b) ((b) ? 1 : 2)
+
+int
+private_mode_state__Darkloard(int mode)
+{
+    switch (mode) {
+        case 1:
+            return DECRPM(app_cursor_keys);
+        case 7:
+            return DECRPM(screen.auto_wrap);
+        case 12:
+            return DECRPM(cursor_blink);
+        case 25:
+            return DECRPM(screen.cursor.visible);
+        case 47:
+        case 1047:
+        case 1049:
+            return DECRPM(in_alt_screen);
+        case 9:
+        case 1000:
+        case 1002:
+        case 1003:
+            return DECRPM(mouse_mode == (enum DarkloardMouseMode)mode);
+        case 1004:
+            return DECRPM(focus_events);
+        case 1006:
+            return DECRPM(mouse_sgr);
+        case 1015:
+            return DECRPM(mouse_urxvt);
+        case 2004:
+            return DECRPM(bracketed_paste);
+        case 2026:
+            return DECRPM(sync_output);
+        default:
+            return 0;
+    }
+}
+
+int
+ansi_mode_state__Darkloard(int mode)
+{
+    switch (mode) {
+        case 4:
+            return DECRPM(screen.insert_mode);
+        case 20: // LNM (newline mode): not supported, always off
+            return 4;
+        default:
+            return 0;
+    }
+}
+
+#undef DECRPM
+
 int64_t
 now_ms__Darkloard(void)
 {
@@ -4657,6 +4764,17 @@ poll__Darkloard(void)
             }
 
             timeout = (int)(DARKLOARD_CURSOR_BLINK_MS - elapsed);
+        }
+
+        // A synchronized update that doesn't end is drawn at the timeout.
+        if (sync_output && screen.is_dirty) {
+            int64_t left = DARKLOARD_SYNC_TIMEOUT_MS -
+                           (now_ms__Darkloard() - sync_output_start_ms);
+            int wait = left > 0 ? (int)left : 0;
+
+            if (timeout < 0 || timeout > wait) {
+                timeout = wait;
+            }
         }
 
         // Keep scrolling while a selection is dragged outside the text, even
