@@ -197,8 +197,6 @@ struct DarkloardScreen
     uint32_t current_fg;
     uint32_t current_bg;
     uint8_t current_attrs;
-    struct DarkloardCursor saved_cursor;
-    bool saved_cursor_valid;
     bool is_dirty;
     bool pending_wrap;
     bool auto_wrap;
@@ -309,7 +307,23 @@ static Pixmap back_buffer = 0;
 static unsigned int back_buffer_width = 0;
 static unsigned int back_buffer_height = 0;
 static struct DarkloardCell **inactive_cells = NULL;
-static struct DarkloardCursor main_cursor_saved = { 0 };
+// Saved by DECSC (ESC 7, CSI s, ?1048, ?1049) and restored by DECRC: the
+// position and everything that affects how the next characters are written.
+// One slot per screen (main / alternate), as in xterm.
+struct DarkloardSavedCursor
+{
+    bool valid;
+    uint32_t row;
+    uint32_t col;
+    bool pending_wrap;
+    uint32_t fg;
+    uint32_t bg;
+    uint8_t attrs;
+    char charsets[2];
+    int active_charset;
+};
+
+static struct DarkloardSavedCursor saved_cursors[2] = { { 0 } };
 static bool in_alt_screen = false;
 static struct DarkloardCell **history_lines = NULL;
 static uint32_t *history_line_cols = NULL;
@@ -535,6 +549,12 @@ clear_history__Darkloard(void);
 
 static void
 enter_alt_screen__Darkloard(bool save_cursor);
+
+static void
+save_cursor__Darkloard(void);
+
+static void
+restore_cursor__Darkloard(void);
 
 static void
 leave_alt_screen__Darkloard(bool restore_cursor);
@@ -1072,7 +1092,8 @@ init__DarkloardScreen(uint32_t rows, uint32_t cols)
     screen.cursor.visible = true;
     screen.scroll_region.top = 0;
     screen.scroll_region.bottom = rows - 1;
-    screen.saved_cursor_valid = false;
+    saved_cursors[0].valid = false;
+    saved_cursors[1].valid = false;
     screen.pending_wrap = false;
     screen.auto_wrap = true;
     screen.insert_mode = false;
@@ -1218,22 +1239,24 @@ resize__DarkloardScreen(uint32_t rows, uint32_t cols)
       in_alt_screen ? &inactive_cells : &screen.cells;
     struct DarkloardCell ***alt_cells =
       in_alt_screen ? &screen.cells : &inactive_cells;
-    struct DarkloardCursor *main_cursor =
-      in_alt_screen ? &main_cursor_saved : &screen.cursor;
+    // While the alternate screen is shown, the main screen's cursor is the
+    // one saved by ?1049 (if any).
+    uint32_t *main_cursor_row =
+      in_alt_screen ? &saved_cursors[0].row : &screen.cursor.row;
 
     // Main screen: keep its content. If it gets shorter than the cursor
     // position, move the top lines to the scrollback so the cursor line stays
     // visible (instead of losing the shell's output).
     uint32_t skip = 0;
 
-    if (main_cursor->row >= rows) {
-        skip = main_cursor->row - rows + 1;
+    if (*main_cursor_row >= rows) {
+        skip = *main_cursor_row - rows + 1;
 
         for (uint32_t i = 0; i < skip; i++) {
             push_history_line__Darkloard((*main_cells)[i], screen.cols);
         }
 
-        main_cursor->row -= skip;
+        *main_cursor_row -= skip;
     }
 
     *main_cells = resize_cells__DarkloardScreen(
@@ -1251,8 +1274,15 @@ resize__DarkloardScreen(uint32_t rows, uint32_t cols)
     screen.pending_wrap = false;
 
     clamp_cursor__DarkloardScreen(&screen.cursor, rows, cols);
-    clamp_cursor__DarkloardScreen(&main_cursor_saved, rows, cols);
-    clamp_cursor__DarkloardScreen(&screen.saved_cursor, rows, cols);
+    for (int i = 0; i < 2; i++) {
+        if (saved_cursors[i].row >= rows) {
+            saved_cursors[i].row = rows - 1;
+        }
+
+        if (saved_cursors[i].col >= cols) {
+            saved_cursors[i].col = cols - 1;
+        }
+    }
 
     screen.is_dirty = true;
 }
@@ -1694,15 +1724,11 @@ handle_esc__DarkloardParser(unsigned char c)
 
             break;
         case '7':
-            screen.saved_cursor = screen.cursor;
-            screen.saved_cursor_valid = true;
+            save_cursor__Darkloard();
 
             break;
         case '8':
-            if (screen.saved_cursor_valid) {
-                screen.pending_wrap = false;
-                screen.cursor = screen.saved_cursor;
-            }
+            restore_cursor__Darkloard();
 
             break;
         case 'c':
@@ -1721,7 +1747,8 @@ handle_esc__DarkloardParser(unsigned char c)
 
             update_event_mask__Darkloard();
             screen.cursor.visible = true;
-            screen.saved_cursor_valid = false;
+            saved_cursors[0].valid = false;
+            saved_cursors[1].valid = false;
             screen.pending_wrap = false;
             screen.auto_wrap = true;
             screen.insert_mode = false;
@@ -2330,6 +2357,14 @@ handle_csi__DarkloardParser(void)
                         focus_events = set;
 
                         break;
+                    case 1048:
+                        if (set) {
+                            save_cursor__Darkloard();
+                        } else {
+                            restore_cursor__Darkloard();
+                        }
+
+                        break;
                     case 1049:
                         if (set) {
                             enter_alt_screen__Darkloard(true);
@@ -2362,8 +2397,7 @@ handle_csi__DarkloardParser(void)
                 break;
             }
 
-            screen.saved_cursor = screen.cursor;
-            screen.saved_cursor_valid = true;
+            save_cursor__Darkloard();
 
             break;
         case 'u':
@@ -2371,10 +2405,7 @@ handle_csi__DarkloardParser(void)
                 break;
             }
 
-            if (screen.saved_cursor_valid) {
-                screen.pending_wrap = false;
-                screen.cursor = screen.saved_cursor;
-            }
+            restore_cursor__Darkloard();
 
             break;
         default:
@@ -3017,7 +3048,7 @@ enter_alt_screen__Darkloard(bool save_cursor)
     }
 
     if (save_cursor) {
-        main_cursor_saved = screen.cursor;
+        save_cursor__Darkloard(); // into the main screen's slot
     }
 
     struct DarkloardCell **tmp = screen.cells;
@@ -3050,17 +3081,56 @@ leave_alt_screen__Darkloard(bool restore_cursor)
     selection.selecting = false;
 
     if (restore_cursor) {
-        screen.pending_wrap = false;
-        screen.cursor = main_cursor_saved;
-
-        if (screen.cursor.row >= screen.rows) {
-            screen.cursor.row = screen.rows > 0 ? screen.rows - 1 : 0;
-        }
-
-        if (screen.cursor.col >= screen.cols) {
-            screen.cursor.col = screen.cols > 0 ? screen.cols - 1 : 0;
-        }
+        restore_cursor__Darkloard(); // from the main screen's slot
     }
+}
+
+void
+save_cursor__Darkloard(void)
+{
+    struct DarkloardSavedCursor *saved = &saved_cursors[in_alt_screen];
+
+    saved->valid = true;
+    saved->row = screen.cursor.row;
+    saved->col = screen.cursor.col;
+    saved->pending_wrap = screen.pending_wrap;
+    saved->fg = screen.current_fg;
+    saved->bg = screen.current_bg;
+    saved->attrs = screen.current_attrs;
+    saved->charsets[0] = screen.charsets[0];
+    saved->charsets[1] = screen.charsets[1];
+    saved->active_charset = screen.active_charset;
+}
+
+// Restores what save_cursor__Darkloard() saved. Without a previous save,
+// moves home and resets attributes and character sets, like xterm. Cursor
+// visibility is not part of the saved state.
+void
+restore_cursor__Darkloard(void)
+{
+    struct DarkloardSavedCursor *saved = &saved_cursors[in_alt_screen];
+
+    if (!saved->valid) {
+        *saved = (struct DarkloardSavedCursor){
+            .row = 0,
+            .col = 0,
+            .fg = DARKLOARD_DEFAULT_FG,
+            .bg = DARKLOARD_DEFAULT_BG,
+            .charsets = { 'B', 'B' },
+        };
+    }
+
+    screen.cursor.row = saved->row < screen.rows ? saved->row : screen.rows - 1;
+    screen.cursor.col = saved->col < screen.cols ? saved->col : screen.cols - 1;
+    // Only keep a pending wrap if the cursor is still on the last column.
+    screen.pending_wrap =
+      saved->pending_wrap && screen.cursor.col == screen.cols - 1;
+    screen.current_fg = saved->fg;
+    screen.current_bg = saved->bg;
+    screen.current_attrs = saved->attrs;
+    screen.charsets[0] = saved->charsets[0];
+    screen.charsets[1] = saved->charsets[1];
+    screen.active_charset = saved->active_charset;
 }
 
 XftFont *
