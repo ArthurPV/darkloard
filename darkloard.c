@@ -368,6 +368,12 @@ static bool cursor_blink_on = true;
 static int64_t cursor_blink_last_ms = 0;
 static bool window_focused = true;
 
+// X input method: composes dead keys (^ + e = ê), compose sequences and
+// input from IMEs (ibus, fcitx), and gives UTF-8 text.
+static XIM xim = NULL;
+static XIC xic = NULL;
+static long xic_event_mask = 0;
+
 // Synchronized output (mode ?2026): drawing is suspended while an
 // application updates the screen, then the whole frame is drawn at once.
 // Drawn anyway after DARKLOARD_SYNC_TIMEOUT_MS in case the end never comes.
@@ -552,6 +558,9 @@ enter_alt_screen__Darkloard(bool save_cursor);
 
 static void
 save_cursor__Darkloard(void);
+
+static void
+init_input_method__Darkloard(void);
 
 static void
 restore_cursor__Darkloard(void);
@@ -3960,7 +3969,7 @@ update_event_mask__Darkloard(void)
 {
     long mask = ExposureMask | KeyPressMask | StructureNotifyMask |
                 ButtonPressMask | ButtonReleaseMask | FocusChangeMask |
-                PropertyChangeMask;
+                PropertyChangeMask | xic_event_mask;
 
     if (mouse_mode == DARKLOARD_MOUSE_ANY) {
         mask |= PointerMotionMask;
@@ -4253,11 +4262,84 @@ handle_motion__Darkloard(XMotionEvent *event)
 }
 
 void
+init_input_method__Darkloard(void)
+{
+    // Use the IM from XMODIFIERS (ibus, fcitx...) if any, else Xlib's
+    // built-in one, which handles dead keys and Compose.
+    if (XSetLocaleModifiers("")) {
+        xim = XOpenIM(display, NULL, NULL, NULL);
+    }
+
+    if (!xim && XSetLocaleModifiers("@im=none")) {
+        xim = XOpenIM(display, NULL, NULL, NULL);
+    }
+
+    if (!xim) {
+        LOG_ERROR("no input method, dead keys won't work");
+        return;
+    }
+
+    xic = XCreateIC(xim,
+                    XNInputStyle,
+                    XIMPreeditNothing | XIMStatusNothing,
+                    XNClientWindow,
+                    window,
+                    XNFocusWindow,
+                    window,
+                    NULL);
+
+    if (!xic) {
+        LOG_ERROR("failed to create input context, dead keys won't work");
+        XCloseIM(xim);
+        xim = NULL;
+        return;
+    }
+
+    XGetICValues(xic, XNFilterEvents, &xic_event_mask, NULL);
+    XSetICFocus(xic);
+    update_event_mask__Darkloard();
+}
+
+void
 handle_keypress__Darkloard(XKeyEvent *event)
 {
-    char buf[32];
+    // Text can be long when an IME commits a whole phrase.
+    static char *buf = NULL;
+    static int buf_cap = 0;
     KeySym keysym = NoSymbol;
-    int len = XLookupString(event, buf, (int)sizeof(buf) - 1, &keysym, NULL);
+    int len;
+
+    if (!buf) {
+        buf_cap = 64;
+        buf = XMALLOC((size_t)buf_cap);
+    }
+
+    if (xic) {
+        Status status;
+
+        len = Xutf8LookupString(xic, event, buf, buf_cap - 1, &keysym, &status);
+
+        if (status == XBufferOverflow) {
+            buf_cap = len + 1;
+            buf = XREALLOC(buf, (size_t)buf_cap);
+            len = Xutf8LookupString(xic, event, buf, buf_cap - 1, &keysym, &status);
+        }
+
+        if (status == XLookupNone) {
+            return;
+        }
+
+        if (status != XLookupChars && status != XLookupBoth) {
+            len = 0;
+        }
+
+        if (status == XLookupChars) {
+            keysym = NoSymbol;
+        }
+    } else {
+        // No input method: no dead keys / compose, but plain keys work.
+        len = XLookupString(event, buf, buf_cap - 1, &keysym, NULL);
+    }
 
     if (event->state & ShiftMask) {
         switch (keysym) {
@@ -4350,7 +4432,12 @@ handle_keypress__Darkloard(XKeyEvent *event)
     reset_cursor_blink__Darkloard();
     clear_selection_highlight__Darkloard();
 
-    if (len > 0) {
+    // X gives BackSpace / Delete text (^H / DEL) that isn't what terminals
+    // send: handle them with the other special keys below.
+    bool special = keysym == XK_BackSpace || keysym == XK_Delete ||
+                   keysym == XK_KP_Delete;
+
+    if (len > 0 && !special) {
         write_pty__Darkloard(buf, (size_t)len);
 
         return;
@@ -4367,6 +4454,7 @@ handle_keypress__Darkloard(XKeyEvent *event)
 
             break;
         case XK_Delete:
+        case XK_KP_Delete:
             write_pty__Darkloard("\033[3~", 4);
 
             break;
@@ -4414,6 +4502,12 @@ handle_x_events__Darkloard(void)
         XEvent event;
 
         XNextEvent(display, &event);
+
+        // The input method consumes events that are part of a composition
+        // (e.g. the dead key "^" before "e").
+        if (XFilterEvent(&event, None)) {
+            continue;
+        }
 
         bool was_dirty = screen.is_dirty;
 
@@ -4469,6 +4563,10 @@ handle_x_events__Darkloard(void)
             case FocusIn:
                 window_focused = true;
 
+                if (xic) {
+                    XSetICFocus(xic);
+                }
+
                 reset_cursor_blink__Darkloard();
 
                 if (focus_events) {
@@ -4479,6 +4577,10 @@ handle_x_events__Darkloard(void)
             case FocusOut:
                 // Stop blinking (cursor stays visible) while unfocused.
                 window_focused = false;
+
+                if (xic) {
+                    XUnsetICFocus(xic);
+                }
 
                 if (focus_events) {
                     write_pty__Darkloard("\033[O", 3);
@@ -4990,6 +5092,14 @@ close__Darkloard(void)
         XFreePixmap(display, back_buffer);
     }
 
+    if (xic) {
+        XDestroyIC(xic);
+    }
+
+    if (xim) {
+        XCloseIM(xim);
+    }
+
     XFreeGC(display, window_gc);
     XCloseDisplay(display);
     close(pty_master_fd);
@@ -5053,6 +5163,7 @@ main()
     XMapWindow(display, window);
 
     init_atoms__Darkloard();
+    init_input_method__Darkloard();
     init_history__Darkloard();
     open_pty__Darkloard();
     handle_window_resize__Darkloard((unsigned short)window_width,
