@@ -300,6 +300,23 @@ static bool app_cursor_keys = false;
 static bool bracketed_paste = false;
 static bool focus_events = false;
 
+// Mouse reporting (xterm protocol), set by "CSI ? <mode> h/l".
+enum DarkloardMouseMode
+{
+    DARKLOARD_MOUSE_NONE = 0,
+    DARKLOARD_MOUSE_X10 = 9,       // presses only
+    DARKLOARD_MOUSE_NORMAL = 1000, // presses and releases
+    DARKLOARD_MOUSE_BUTTON = 1002, // + motion while a button is held
+    DARKLOARD_MOUSE_ANY = 1003,    // + all motion
+};
+
+static enum DarkloardMouseMode mouse_mode = DARKLOARD_MOUSE_NONE;
+static bool mouse_sgr = false;   // 1006: CSI < b ; x ; y M/m
+static bool mouse_urxvt = false; // 1015: CSI b ; x ; y M
+static int mouse_button_held = -1; // 0-2 while a button is down, else -1
+static uint32_t mouse_last_row = UINT32_MAX;
+static uint32_t mouse_last_col = UINT32_MAX;
+
 static Atom atom_utf8_string = None;
 static Atom atom_clipboard = None;
 static Atom atom_targets = None;
@@ -501,6 +518,20 @@ handle_selection_notify__Darkloard(XSelectionEvent *event);
 
 static void
 handle_property_notify__Darkloard(XPropertyEvent *event);
+
+static void
+update_event_mask__Darkloard(void);
+
+static bool
+mouse_reporting__Darkloard(unsigned int state);
+
+static void
+send_mouse_event__Darkloard(int button,
+                            bool release,
+                            bool motion,
+                            unsigned int state,
+                            int px,
+                            int py);
 
 static void
 handle_button_press__Darkloard(XButtonEvent *event);
@@ -1452,6 +1483,12 @@ handle_esc__DarkloardParser(unsigned char c)
             app_cursor_keys = false;
             bracketed_paste = false;
             focus_events = false;
+            mouse_mode = DARKLOARD_MOUSE_NONE;
+            mouse_sgr = false;
+            mouse_urxvt = false;
+            mouse_button_held = -1;
+
+            update_event_mask__Darkloard();
             screen.cursor.visible = true;
             screen.saved_cursor_valid = false;
             screen.pending_wrap = false;
@@ -1962,12 +1999,30 @@ handle_csi__DarkloardParser(void)
                         }
 
                         break;
+                    case 9:
                     case 1000:
-                    case 1001:
                     case 1002:
                     case 1003:
+                        // Like xterm, resetting any tracking mode turns
+                        // mouse reporting off.
+                        mouse_mode = set ? (enum DarkloardMouseMode)mode
+                                         : DARKLOARD_MOUSE_NONE;
+                        mouse_button_held = -1;
+                        mouse_last_row = UINT32_MAX;
+                        mouse_last_col = UINT32_MAX;
+
+                        update_event_mask__Darkloard();
+
+                        break;
                     case 1006:
+                        mouse_sgr = set;
+
+                        break;
                     case 1015:
+                        mouse_urxvt = set;
+
+                        break;
+                    case 1001:
                         break;
                     case 1004:
                         focus_events = set;
@@ -3285,9 +3340,158 @@ handle_property_notify__Darkloard(XPropertyEvent *event)
     }
 }
 
+// Only ask X for the motion events we need: all pointer motion is a lot of
+// events, and is only needed for mouse mode 1003.
+void
+update_event_mask__Darkloard(void)
+{
+    long mask = ExposureMask | KeyPressMask | StructureNotifyMask |
+                ButtonPressMask | ButtonReleaseMask | FocusChangeMask |
+                PropertyChangeMask;
+
+    if (mouse_mode == DARKLOARD_MOUSE_ANY) {
+        mask |= PointerMotionMask;
+    } else if (mouse_mode == DARKLOARD_MOUSE_BUTTON) {
+        mask |= ButtonMotionMask;
+    } else {
+        mask |= Button1MotionMask; // selection
+    }
+
+    XSelectInput(display, window, mask);
+}
+
+// Whether a mouse event goes to the application. Holding Shift keeps the
+// terminal's own selection / scrolling, as in xterm.
+bool
+mouse_reporting__Darkloard(unsigned int state)
+{
+    return mouse_mode != DARKLOARD_MOUSE_NONE && !(state & ShiftMask);
+}
+
+// button: 0-2 (left, middle, right), 3 (no button, for motion), 64-67
+// (wheel).
+void
+send_mouse_event__Darkloard(int button,
+                            bool release,
+                            bool motion,
+                            unsigned int state,
+                            int px,
+                            int py)
+{
+    uint32_t row, col;
+
+    pixel_to_cell__Darkloard(px, py, &row, &col);
+
+    if (motion) {
+        if (row == mouse_last_row && col == mouse_last_col) {
+            return;
+        }
+    }
+
+    mouse_last_row = row;
+    mouse_last_col = col;
+
+    int cb = button;
+
+    if (mouse_mode != DARKLOARD_MOUSE_X10) {
+        if (state & ShiftMask) {
+            cb += 4;
+        }
+
+        if (state & Mod1Mask) {
+            cb += 8;
+        }
+
+        if (state & ControlMask) {
+            cb += 16;
+        }
+    }
+
+    if (motion) {
+        cb += 32;
+    }
+
+    int x = (int)col + 1;
+    int y = (int)row + 1;
+    char buf[64];
+    int len;
+
+    if (mouse_sgr) {
+        // SGR keeps the released button and has no coordinate limit.
+        len = snprintf(buf,
+                       sizeof(buf),
+                       "\033[<%d;%d;%d%c",
+                       cb,
+                       x,
+                       y,
+                       release ? 'm' : 'M');
+    } else {
+        if (release) {
+            cb = (cb & ~3) | 3; // legacy encodings: release is button 3
+        }
+
+        if (mouse_urxvt) {
+            len = snprintf(
+              buf, sizeof(buf), "\033[%d;%d;%dM", cb + 32, x, y);
+        } else {
+            // Legacy encoding: one byte each, so coordinates stop at 223.
+            if (x > 223 || y > 223) {
+                return;
+            }
+
+            len = snprintf(buf,
+                           sizeof(buf),
+                           "\033[M%c%c%c",
+                           (char)(cb + 32),
+                           (char)(x + 32),
+                           (char)(y + 32));
+        }
+    }
+
+    // The view must show what the application sees.
+    scroll_offset = 0;
+
+    write_pty__Darkloard(buf, (size_t)len);
+}
+
 void
 handle_button_press__Darkloard(XButtonEvent *event)
 {
+    if (mouse_reporting__Darkloard(event->state)) {
+        int button = -1;
+
+        switch (event->button) {
+            case Button1:
+            case Button2:
+            case Button3:
+                button = (int)event->button - Button1;
+                mouse_button_held = button;
+
+                break;
+            case Button4:
+            case Button5:
+                button = 64 + (int)event->button - Button4;
+
+                break;
+            case 6:
+            case 7:
+                button = 66 + (int)event->button - 6;
+
+                break;
+            default:
+                break;
+        }
+
+        // X10 mode doesn't report the wheel.
+        if (button >= 0 &&
+            !(mouse_mode == DARKLOARD_MOUSE_X10 && button >= 64)) {
+            send_mouse_event__Darkloard(
+              button, false, false, event->state, event->x, event->y);
+        }
+
+        return;
+    }
+
     if (event->button == Button1) {
         deinit__DarkloardSelection();
 
@@ -3330,6 +3534,25 @@ handle_button_press__Darkloard(XButtonEvent *event)
 void
 handle_button_release__Darkloard(XButtonEvent *event)
 {
+    // A selection started with Shift ends normally even if Shift was
+    // released meanwhile.
+    if (!selection.selecting && mouse_reporting__Darkloard(event->state)) {
+        if (event->button >= Button1 && event->button <= Button3) {
+            int button = (int)event->button - Button1;
+
+            if (button == mouse_button_held) {
+                mouse_button_held = -1;
+            }
+
+            if (mouse_mode != DARKLOARD_MOUSE_X10) {
+                send_mouse_event__Darkloard(
+                  button, true, false, event->state, event->x, event->y);
+            }
+        }
+
+        return;
+    }
+
     if (event->button != Button1 || !selection.selecting) {
         return;
     }
@@ -3353,12 +3576,28 @@ handle_button_release__Darkloard(XButtonEvent *event)
 void
 handle_motion__Darkloard(XMotionEvent *event)
 {
-    if (!selection.selecting) {
+    if (selection.selecting) {
+        pixel_to_selection__Darkloard(
+          event->x, event->y, &selection.end_row, &selection.end_col);
+
         return;
     }
 
-    pixel_to_selection__Darkloard(
-      event->x, event->y, &selection.end_row, &selection.end_col);
+    if (!mouse_reporting__Darkloard(event->state)) {
+        return;
+    }
+
+    bool held = mouse_button_held >= 0;
+
+    if (mouse_mode == DARKLOARD_MOUSE_ANY ||
+        (mouse_mode == DARKLOARD_MOUSE_BUTTON && held)) {
+        send_mouse_event__Darkloard(held ? mouse_button_held : 3,
+                                    false,
+                                    true,
+                                    event->state,
+                                    event->x,
+                                    event->y);
+    }
 }
 
 void
@@ -3519,6 +3758,8 @@ handle_x_events__Darkloard(void)
 
         XNextEvent(display, &event);
 
+        bool was_dirty = screen.is_dirty;
+
         screen.is_dirty = true;
 
         switch (event.type) {
@@ -3546,6 +3787,9 @@ handle_x_events__Darkloard(void)
                 break;
             case MotionNotify:
                 handle_motion__Darkloard(&event.xmotion);
+
+                // Only a selection being dragged changes what is drawn.
+                screen.is_dirty = was_dirty || selection.selecting;
 
                 break;
             case SelectionRequest:
@@ -3829,11 +4073,7 @@ main()
     window_gc = XCreateGC(display, window, 0, NULL);
 
     XStoreName(display, window, "Darkloard");
-    XSelectInput(display,
-                 window,
-                 ExposureMask | KeyPressMask | StructureNotifyMask |
-                   ButtonPressMask | ButtonReleaseMask | Button1MotionMask |
-                   FocusChangeMask | PropertyChangeMask);
+    update_event_mask__Darkloard();
     XMapWindow(display, window);
 
     init_atoms__Darkloard();
