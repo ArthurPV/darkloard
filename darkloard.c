@@ -344,6 +344,13 @@ static bool cursor_blink_on = true;
 static int64_t cursor_blink_last_ms = 0;
 static bool window_focused = true;
 
+// Pointer position while dragging a selection, for auto-scrolling when it
+// is above / below the text area.
+static int drag_x = 0;
+static int drag_y = 0;
+static int64_t autoscroll_last_ms = 0;
+#define DARKLOARD_AUTOSCROLL_MS 50
+
 // Mouse reporting (xterm protocol), set by "CSI ? <mode> h/l".
 enum DarkloardMouseMode
 {
@@ -577,6 +584,12 @@ reset_cursor_blink__Darkloard(void);
 
 static void
 clear_selection_highlight__Darkloard(void);
+
+static int
+autoscroll_lines__Darkloard(void);
+
+static void
+autoscroll__Darkloard(void);
 
 static void
 update_event_mask__Darkloard(void);
@@ -3957,6 +3970,8 @@ handle_button_press__Darkloard(XButtonEvent *event)
 
         selection.end_row = selection.start_row;
         selection.end_col = selection.start_col;
+        drag_x = event->x;
+        drag_y = event->y;
     } else if (event->button == Button2) {
         clear_selection_highlight__Darkloard();
         request_paste__Darkloard(XA_PRIMARY);
@@ -3984,6 +3999,13 @@ handle_button_press__Darkloard(XButtonEvent *event)
                 scroll_offset = 0;
             }
         }
+    }
+
+    // Scrolling with the wheel while dragging extends the selection.
+    if (selection.selecting &&
+        (event->button == Button4 || event->button == Button5)) {
+        pixel_to_selection__Darkloard(
+          drag_x, drag_y, &selection.end_row, &selection.end_col);
     }
 }
 
@@ -4033,6 +4055,9 @@ void
 handle_motion__Darkloard(XMotionEvent *event)
 {
     if (selection.selecting) {
+        drag_x = event->x;
+        drag_y = event->y;
+
         pixel_to_selection__Darkloard(
           event->x, event->y, &selection.end_row, &selection.end_col);
 
@@ -4355,6 +4380,72 @@ handle_pty_events__Darkloard(void)
     return is_terminal_alive__Darkloard();
 }
 
+// Lines to scroll per step while dragging a selection: negative = towards
+// the history (pointer above the text), positive = towards the bottom,
+// 0 = pointer inside. Faster the further the pointer is.
+int
+autoscroll_lines__Darkloard(void)
+{
+    if (!selection.selecting || !fonts[FONT_REGULAR]) {
+        return 0;
+    }
+
+    int cell_h = fonts[FONT_REGULAR]->ascent + fonts[FONT_REGULAR]->descent;
+    int top = DARKLOARD_MARGIN_TOP;
+    int bottom = DARKLOARD_MARGIN_TOP + (int)screen.rows * cell_h;
+
+    if (drag_y < top) {
+        int n = 1 + (top - drag_y) / cell_h;
+
+        return -(n > 10 ? 10 : n);
+    }
+
+    if (drag_y >= bottom) {
+        int n = 1 + (drag_y - bottom) / cell_h;
+
+        return n > 10 ? 10 : n;
+    }
+
+    return 0;
+}
+
+void
+autoscroll__Darkloard(void)
+{
+    int lines = autoscroll_lines__Darkloard();
+
+    if (lines == 0) {
+        return;
+    }
+
+    int64_t now = now_ms__Darkloard();
+
+    if (now - autoscroll_last_ms < DARKLOARD_AUTOSCROLL_MS) {
+        return;
+    }
+
+    autoscroll_last_ms = now;
+
+    int old_offset = scroll_offset;
+
+    scroll_offset -= lines;
+
+    if (scroll_offset > history_count) {
+        scroll_offset = history_count;
+    }
+
+    if (scroll_offset < 0) {
+        scroll_offset = 0;
+    }
+
+    if (scroll_offset != old_offset) {
+        pixel_to_selection__Darkloard(
+          drag_x, drag_y, &selection.end_row, &selection.end_col);
+
+        screen.is_dirty = true;
+    }
+}
+
 int64_t
 now_ms__Darkloard(void)
 {
@@ -4418,6 +4509,17 @@ poll__Darkloard(void)
             }
 
             timeout = (int)(DARKLOARD_CURSOR_BLINK_MS - elapsed);
+        }
+
+        // Keep scrolling while a selection is dragged outside the text, even
+        // if the pointer doesn't move.
+        if (autoscroll_lines__Darkloard() != 0) {
+            autoscroll__Darkloard();
+            draw__Darkloard();
+
+            if (timeout < 0 || timeout > DARKLOARD_AUTOSCROLL_MS) {
+                timeout = DARKLOARD_AUTOSCROLL_MS;
+            }
         }
 
         // Xlib may already have read events into its queue (e.g. during
