@@ -172,6 +172,18 @@ struct DarkloardCell
     uint32_t fg;
     uint32_t bg;
     uint8_t attrs;
+    // Combining marks (accents...) drawn over this character: index in
+    // combining_table, 0 = none. Fits in the struct padding.
+    uint16_t combining;
+};
+
+// Interned sequences of combining marks, shared by all cells.
+#define DARKLOARD_MAX_COMBINING 4
+
+struct DarkloardCombining
+{
+    uint32_t marks[DARKLOARD_MAX_COMBINING];
+    uint8_t len;
 };
 
 struct DarkloardCursor
@@ -324,6 +336,12 @@ struct DarkloardSavedCursor
 };
 
 static struct DarkloardSavedCursor saved_cursors[2] = { { 0 } };
+
+// Entry 0 is unused ("no marks"). Entries are never removed: the number of
+// distinct mark sequences seen in a session is small.
+static struct DarkloardCombining *combining_table = NULL;
+static uint32_t combining_len = 1;
+static uint32_t combining_cap = 0;
 static bool in_alt_screen = false;
 static struct DarkloardCell **history_lines = NULL;
 static uint32_t *history_line_cols = NULL;
@@ -553,6 +571,15 @@ enter_alt_screen__Darkloard(bool save_cursor);
 static void
 save_cursor__Darkloard(void);
 
+static uint16_t
+add_combining__Darkloard(uint16_t id, uint32_t mark);
+
+static const struct DarkloardCombining *
+get_combining__Darkloard(uint16_t id);
+
+static bool
+is_invisible_mark__Darkloard(uint32_t cp);
+
 static void
 restore_cursor__Darkloard(void);
 
@@ -565,6 +592,7 @@ get_font_for_codepoint__Darkloard(uint32_t cp, uint8_t attrs);
 static void
 draw_glyph__Darkloard(XftDraw *draw,
                       uint32_t codepoint,
+                      uint16_t combining,
                       uint32_t color,
                       uint8_t attrs,
                       int cell_w,
@@ -1391,6 +1419,63 @@ scroll_down__DarkloardScreen(uint32_t top, uint32_t bottom, uint32_t n)
     }
 }
 
+// Returns the id of the sequence `id` + `mark`, adding it if needed.
+// Returns `id` unchanged when the sequence is full or the table is.
+uint16_t
+add_combining__Darkloard(uint16_t id, uint32_t mark)
+{
+    struct DarkloardCombining seq = { .len = 0 };
+
+    if (id != 0) {
+        seq = combining_table[id];
+    }
+
+    if (seq.len >= DARKLOARD_MAX_COMBINING) {
+        return id;
+    }
+
+    seq.marks[seq.len++] = mark;
+
+    for (uint32_t i = 1; i < combining_len; i++) {
+        if (combining_table[i].len == seq.len &&
+            memcmp(combining_table[i].marks,
+                   seq.marks,
+                   seq.len * sizeof(uint32_t)) == 0) {
+            return (uint16_t)i;
+        }
+    }
+
+    if (combining_len > UINT16_MAX) {
+        return id;
+    }
+
+    if (combining_len >= combining_cap) {
+        combining_cap = combining_cap ? combining_cap * 2 : 64;
+        combining_table = XREALLOC(
+          combining_table, combining_cap * sizeof(struct DarkloardCombining));
+    }
+
+    combining_table[combining_len] = seq;
+
+    return (uint16_t)combining_len++;
+}
+
+// Zero-width characters that are kept (for copying) but have no glyph:
+// joiners, variation selectors (emoji / text presentation), etc.
+bool
+is_invisible_mark__Darkloard(uint32_t cp)
+{
+    return (cp >= 0x200B && cp <= 0x200F) || (cp >= 0x2060 && cp <= 0x2064) ||
+           (cp >= 0xFE00 && cp <= 0xFE0F) || (cp >= 0x180B && cp <= 0x180F) ||
+           (cp >= 0xE0000 && cp <= 0xE0FFF) || cp == 0x034F || cp == 0xFEFF;
+}
+
+const struct DarkloardCombining *
+get_combining__Darkloard(uint16_t id)
+{
+    return (id != 0 && id < combining_len) ? &combining_table[id] : NULL;
+}
+
 void
 put_char__DarkloardScreen(uint32_t codepoint)
 {
@@ -1412,9 +1497,36 @@ put_char__DarkloardScreen(uint32_t codepoint)
         codepoint = dec_graphics[codepoint - 0x5F];
     }
 
-    screen.last_char = codepoint;
-
     int width = wcwidth((wchar_t)codepoint);
+
+    // Combining mark (zero width): attach it to the previous character
+    // instead of taking a cell.
+    if (width == 0) {
+        uint32_t row = screen.cursor.row;
+        uint32_t col = screen.cursor.col;
+
+        // With a pending wrap the cursor is still on the last character.
+        if (!screen.pending_wrap) {
+            if (col == 0) {
+                return; // nothing to attach to
+            }
+
+            col--;
+        }
+
+        // The right half of a wide character belongs to the one before.
+        if (col > 0 && screen.cells[row][col].codepoint == 0) {
+            col--;
+        }
+
+        struct DarkloardCell *cell = &screen.cells[row][col];
+
+        cell->combining = add_combining__Darkloard(cell->combining, codepoint);
+
+        return;
+    }
+
+    screen.last_char = codepoint;
 
     if (width < 0) {
         width = 1;
@@ -3293,6 +3405,7 @@ clear_history__Darkloard(void)
 void
 draw_glyph__Darkloard(XftDraw *draw,
                       uint32_t codepoint,
+                      uint16_t combining,
                       uint32_t color,
                       uint8_t attrs,
                       int cell_w,
@@ -3314,6 +3427,43 @@ draw_glyph__Darkloard(XftDraw *draw,
 
     XftDrawStringUtf8(
       draw, &xft_color, glyph_font, x, baseline_y, (FcChar8 *)utf8, utf8_len);
+
+    const struct DarkloardCombining *marks = get_combining__Darkloard(combining);
+
+    if (marks) {
+        // Fonts disagree on where a mark's ink is relative to its origin
+        // (some draw it over the previous glyph, some after the origin), so
+        // center its ink over the base character's cell(s) instead.
+        int base_w = wcwidth((wchar_t)codepoint) == 2 ? 2 * cell_w : cell_w;
+
+        for (uint8_t i = 0; i < marks->len; i++) {
+            uint32_t mark = marks->marks[i];
+
+            if (is_invisible_mark__Darkloard(mark)) {
+                continue;
+            }
+
+            char mark_utf8[5] = { 0 };
+            int mark_len = codepoint_to_utf8__Darkloard(mark, mark_utf8);
+            XftFont *mark_font = get_font_for_codepoint__Darkloard(mark, attrs);
+            XGlyphInfo ink;
+
+            XftTextExtentsUtf8(
+              display, mark_font, (FcChar8 *)mark_utf8, mark_len, &ink);
+
+            // ink.x is the distance from the origin to the ink's left edge.
+            int mark_x = x + (base_w - (int)ink.width) / 2 + ink.x;
+
+            XftDrawStringUtf8(draw,
+                              &xft_color,
+                              mark_font,
+                              mark_x,
+                              baseline_y,
+                              (FcChar8 *)mark_utf8,
+                              mark_len);
+        }
+    }
+
     XftColorFree(display, visual, colormap, &xft_color);
 
     if (attrs & DARKLOARD_ATTR_UNDERLINE) {
@@ -3428,8 +3578,14 @@ draw__Darkloard(void)
             }
 
             if (cell->codepoint != 0 && cell->codepoint != ' ') {
-                draw_glyph__Darkloard(
-                  draw, cell->codepoint, fg, cell->attrs, cell_w, x, y);
+                draw_glyph__Darkloard(draw,
+                                      cell->codepoint,
+                                      cell->combining,
+                                      fg,
+                                      cell->attrs,
+                                      cell_w,
+                                      x,
+                                      y);
             }
         }
     }
@@ -3476,6 +3632,7 @@ draw__Darkloard(void)
             if (cur_cell->codepoint != 0 && cur_cell->codepoint != ' ') {
                 draw_glyph__Darkloard(draw,
                                       cur_cell->codepoint,
+                                      cur_cell->combining,
                                       DARKLOARD_DEFAULT_BG,
                                       cur_cell->attrs,
                                       cell_w,
@@ -3729,6 +3886,16 @@ build_selection_text__DarkloardSelection(void)
                     int utf8_len = codepoint_to_utf8__Darkloard(cp, utf8);
 
                     append__DarkloardBuffer(&out, utf8, (size_t)utf8_len);
+
+                    const struct DarkloardCombining *marks =
+                      get_combining__Darkloard(cells[c].combining);
+
+                    for (uint8_t m = 0; marks && m < marks->len; m++) {
+                        utf8_len =
+                          codepoint_to_utf8__Darkloard(marks->marks[m], utf8);
+
+                        append__DarkloardBuffer(&out, utf8, (size_t)utf8_len);
+                    }
                 }
             }
         }
@@ -5005,6 +5172,7 @@ close__Darkloard(void)
     free(pty_out.data);
     free(paste_in.data);
     free(parser.osc_buf);
+    free(combining_table);
 }
 
 int
