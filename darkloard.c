@@ -204,9 +204,15 @@ enum DarkloardParseState
 struct DarkloardCsiParams
 {
     int params[DARKLOARD_CSI_MAX_PARAMS];
+    // is_sub[i]: params[i] was separated from the previous one by ':'
+    // (sub-parameter, e.g. "4:3" or "38:2::r:g:b").
+    bool is_sub[DARKLOARD_CSI_MAX_PARAMS];
     int params_len;
     bool private_mode;
     bool secondary;
+    // '<' or '=' prefix (e.g. kitty keyboard protocol): not supported, the
+    // whole sequence is ignored.
+    bool other_private;
     char intermediate;
     char final_byte;
 };
@@ -368,6 +374,12 @@ static void
 scroll_up__DarkloardScreen(uint32_t top, uint32_t bottom, uint32_t n);
 
 static void
+scroll_region_up__DarkloardScreen(uint32_t top,
+                                  uint32_t bottom,
+                                  uint32_t n,
+                                  bool to_history);
+
+static void
 scroll_down__DarkloardScreen(uint32_t top, uint32_t bottom, uint32_t n);
 
 static void
@@ -420,6 +432,9 @@ push_history_line__Darkloard(struct DarkloardCell *line, uint32_t cols);
 
 static void
 init_history__Darkloard(void);
+
+static void
+erase_history__Darkloard(void);
 
 static struct DarkloardCell *
 get_history_line__Darkloard(int i);
@@ -1019,8 +1034,21 @@ resize__DarkloardScreen(uint32_t rows, uint32_t cols)
 void
 scroll_up__DarkloardScreen(uint32_t top, uint32_t bottom, uint32_t n)
 {
+    scroll_region_up__DarkloardScreen(top, bottom, n, true);
+}
+
+void
+scroll_region_up__DarkloardScreen(uint32_t top,
+                                  uint32_t bottom,
+                                  uint32_t n,
+                                  bool to_history)
+{
+    if (top > bottom || bottom >= screen.rows) {
+        return;
+    }
+
     uint32_t region_height = bottom - top + 1;
-    bool save = (top == 0 && !in_alt_screen);
+    bool save = (to_history && top == 0 && !in_alt_screen);
 
     if (n >= region_height) {
         if (save) {
@@ -1068,6 +1096,10 @@ scroll_up__DarkloardScreen(uint32_t top, uint32_t bottom, uint32_t n)
 void
 scroll_down__DarkloardScreen(uint32_t top, uint32_t bottom, uint32_t n)
 {
+    if (top > bottom || bottom >= screen.rows) {
+        return;
+    }
+
     uint32_t region_height = bottom - top + 1;
 
     if (n >= region_height) {
@@ -1351,13 +1383,10 @@ handle_normal__DarkloardParser(unsigned char c)
             break;
         case DARKLOARD_DEL:
             break;
-        case DARKLOARD_CSI:
-            memset(&parser.csi, 0, sizeof(parser.csi));
-
-            parser.state = DARKLOARD_PARSE_STATE_CSI;
-
-            break;
         default:
+            // Note: 8-bit C1 controls (e.g. 0x9B CSI) are not interpreted:
+            // in UTF-8 those bytes are continuation bytes (0x9B is part of
+            // "Û", for instance).
             if (c >= 0xF0 && c <= 0xF4) {
                 parser.utf8_codepoint = c & 0x07;
                 parser.utf8_remaining = 3;
@@ -1418,6 +1447,13 @@ handle_esc__DarkloardParser(unsigned char c)
 
             break;
         case 'c':
+            leave_alt_screen__Darkloard(false);
+
+            app_cursor_keys = false;
+            bracketed_paste = false;
+            focus_events = false;
+            screen.cursor.visible = true;
+            screen.saved_cursor_valid = false;
             screen.pending_wrap = false;
             screen.auto_wrap = true;
             screen.cursor.row = 0;
@@ -1431,25 +1467,13 @@ handle_esc__DarkloardParser(unsigned char c)
             erase_display__DarkloardScreen(2);
 
             break;
-        case 'D':
-            screen.cursor.row++;
-
-            if (screen.cursor.row > screen.scroll_region.bottom) {
-                screen.cursor.row = screen.scroll_region.bottom;
-                scroll_up__DarkloardScreen(
-                  screen.scroll_region.top, screen.scroll_region.bottom, 1);
-            }
-
-            break;
         case 'E':
             screen.cursor.col = 0;
-            screen.cursor.row++;
-
-            if (screen.cursor.row > screen.scroll_region.bottom) {
-                screen.cursor.row = screen.scroll_region.bottom;
-                scroll_up__DarkloardScreen(
-                  screen.scroll_region.top, screen.scroll_region.bottom, 1);
-            }
+            /* fall through */
+        case 'D':
+            // Same as LF: scroll only at the bottom margin, otherwise move
+            // down (without leaving the screen).
+            handle_normal__DarkloardParser(DARKLOARD_LF);
 
             break;
         case 'M':
@@ -1487,6 +1511,32 @@ handle_esc__DarkloardParser(unsigned char c)
 void
 handle_csi_byte__DarkloardParser(unsigned char c)
 {
+    if (c == DARKLOARD_ESC) {
+        // ESC aborts the sequence and starts a new one.
+        parser.state = DARKLOARD_PARSE_STATE_ESC;
+        return;
+    }
+
+    if (c == DARKLOARD_CAN || c == DARKLOARD_SUB) {
+        parser.state = DARKLOARD_PARSE_STATE_NORMAL;
+        return;
+    }
+
+    if (c < 0x20) {
+        // C0 controls inside a sequence are executed, the sequence goes on.
+        handle_normal__DarkloardParser(c);
+        return;
+    }
+
+    if (c == DARKLOARD_DEL) {
+        return;
+    }
+
+    if (c == '<' || c == '=') {
+        parser.csi.other_private = true;
+        return;
+    }
+
     if (c == '?') {
         parser.csi.private_mode = true;
         return;
@@ -1509,17 +1559,21 @@ handle_csi_byte__DarkloardParser(unsigned char c)
 
         int idx = parser.csi.params_len - 1;
 
-        parser.csi.params[idx] = parser.csi.params[idx] * 10 + (c - '0');
+        // Cap values to avoid signed overflow on absurdly long parameters.
+        if (parser.csi.params[idx] < 65535) {
+            parser.csi.params[idx] = parser.csi.params[idx] * 10 + (c - '0');
+        }
 
         return;
     }
 
-    if (c == ';') {
+    if (c == ';' || c == ':') {
         if (parser.csi.params_len == 0) {
             parser.csi.params_len = 1;
         }
 
         if (parser.csi.params_len < DARKLOARD_CSI_MAX_PARAMS) {
+            parser.csi.is_sub[parser.csi.params_len] = (c == ':');
             parser.csi.params_len++;
         }
 
@@ -1546,26 +1600,42 @@ handle_csi__DarkloardParser(void)
        ? parser.csi.params[n]                                \
        : (def))
 
+    if (parser.csi.other_private) {
+        return;
+    }
+
+    // Sequences with a '?' / '>' prefix or an intermediate byte are different
+    // commands (e.g. "CSI > 4 ; 2 m" is xterm's modifyOtherKeys, sent by vim,
+    // not SGR). Only a few of them are supported, handled below.
+    bool plain = !parser.csi.private_mode && !parser.csi.secondary &&
+                 parser.csi.intermediate == 0;
+
     switch (parser.csi.final_byte) {
         case 'A': {
             int n = CSI_PARAM(0, 1);
             int new_row = (int)screen.cursor.row - n;
+            // Stop at the top margin, unless the cursor is already above it.
+            int limit = screen.cursor.row >= screen.scroll_region.top
+                          ? (int)screen.scroll_region.top
+                          : 0;
 
             screen.pending_wrap = false;
-            screen.cursor.row = new_row < (int)screen.scroll_region.top
-                                  ? screen.scroll_region.top
-                                  : (uint32_t)new_row;
+            screen.cursor.row =
+              new_row < limit ? (uint32_t)limit : (uint32_t)new_row;
 
             break;
         }
         case 'B': {
             int n = CSI_PARAM(0, 1);
             int new_row = (int)screen.cursor.row + n;
+            // Stop at the bottom margin, unless the cursor is already below.
+            int limit = screen.cursor.row <= screen.scroll_region.bottom
+                          ? (int)screen.scroll_region.bottom
+                          : (int)screen.rows - 1;
 
             screen.pending_wrap = false;
-            screen.cursor.row = new_row > (int)screen.scroll_region.bottom
-                                  ? screen.scroll_region.bottom
-                                  : (uint32_t)new_row;
+            screen.cursor.row =
+              new_row > limit ? (uint32_t)limit : (uint32_t)new_row;
 
             break;
         }
@@ -1591,11 +1661,14 @@ handle_csi__DarkloardParser(void)
         case 'E': {
             int n = CSI_PARAM(0, 1);
             int new_row = (int)screen.cursor.row + n;
+            // Stop at the bottom margin, unless the cursor is already below.
+            int limit = screen.cursor.row <= screen.scroll_region.bottom
+                          ? (int)screen.scroll_region.bottom
+                          : (int)screen.rows - 1;
 
             screen.pending_wrap = false;
-            screen.cursor.row = new_row > (int)screen.scroll_region.bottom
-                                  ? screen.scroll_region.bottom
-                                  : (uint32_t)new_row;
+            screen.cursor.row =
+              new_row > limit ? (uint32_t)limit : (uint32_t)new_row;
             screen.cursor.col = 0;
 
             break;
@@ -1603,11 +1676,14 @@ handle_csi__DarkloardParser(void)
         case 'F': {
             int n = CSI_PARAM(0, 1);
             int new_row = (int)screen.cursor.row - n;
+            // Stop at the top margin, unless the cursor is already above it.
+            int limit = screen.cursor.row >= screen.scroll_region.top
+                          ? (int)screen.scroll_region.top
+                          : 0;
 
             screen.pending_wrap = false;
-            screen.cursor.row = new_row < (int)screen.scroll_region.top
-                                  ? screen.scroll_region.top
-                                  : (uint32_t)new_row;
+            screen.cursor.row =
+              new_row < limit ? (uint32_t)limit : (uint32_t)new_row;
             screen.cursor.col = 0;
 
             break;
@@ -1638,7 +1714,12 @@ handle_csi__DarkloardParser(void)
         case 'J': {
             int mode = parser.csi.params_len > 0 ? parser.csi.params[0] : 0;
 
-            erase_display__DarkloardScreen(mode);
+            if (mode == 3) {
+                // "Erase saved lines": clear the scrollback (sent by `clear`).
+                erase_history__Darkloard();
+            } else {
+                erase_display__DarkloardScreen(mode);
+            }
 
             break;
         }
@@ -1649,19 +1730,31 @@ handle_csi__DarkloardParser(void)
 
             break;
         }
-        case 'L': {
-            int n = CSI_PARAM(0, 1);
-
-            scroll_down__DarkloardScreen(
-              screen.cursor.row, screen.scroll_region.bottom, (uint32_t)n);
-
-            break;
-        }
+        case 'L':
         case 'M': {
             int n = CSI_PARAM(0, 1);
 
-            scroll_up__DarkloardScreen(
-              screen.cursor.row, screen.scroll_region.bottom, (uint32_t)n);
+            // Outside the scroll region these do nothing. Without this check
+            // top > bottom made the scroll functions alias two row pointers
+            // (heap corruption / double free).
+            if (screen.cursor.row < screen.scroll_region.top ||
+                screen.cursor.row > screen.scroll_region.bottom) {
+                break;
+            }
+
+            screen.pending_wrap = false;
+            screen.cursor.col = 0;
+
+            if (parser.csi.final_byte == 'L') {
+                scroll_down__DarkloardScreen(
+                  screen.cursor.row, screen.scroll_region.bottom, (uint32_t)n);
+            } else {
+                // Deleted lines must not go to the scrollback.
+                scroll_region_up__DarkloardScreen(screen.cursor.row,
+                                                  screen.scroll_region.bottom,
+                                                  (uint32_t)n,
+                                                  false);
+            }
 
             break;
         }
@@ -1792,7 +1885,9 @@ handle_csi__DarkloardParser(void)
             break;
         }
         case 'm':
-            handle_sgr__DarkloardParser();
+            if (plain) {
+                handle_sgr__DarkloardParser();
+            }
 
             break;
         case 'q':
@@ -1814,6 +1909,10 @@ handle_csi__DarkloardParser(void)
             break;
         }
         case 'r': {
+            if (!plain) {
+                break;
+            }
+
             int top = CSI_PARAM(0, 1);
             int bottom = CSI_PARAM(1, (int)screen.rows);
 
@@ -1832,8 +1931,10 @@ handle_csi__DarkloardParser(void)
         case 'l': {
             bool set = parser.csi.final_byte == 'h';
 
-            if (parser.csi.private_mode) {
-                int mode = parser.csi.params_len > 0 ? parser.csi.params[0] : 0;
+            for (int pi = 0;
+                 parser.csi.private_mode && pi < parser.csi.params_len;
+                 pi++) {
+                int mode = parser.csi.params[pi];
 
                 switch (mode) {
                     case 1:
@@ -1892,11 +1993,19 @@ handle_csi__DarkloardParser(void)
             break;
         }
         case 's':
+            if (!plain) {
+                break;
+            }
+
             screen.saved_cursor = screen.cursor;
             screen.saved_cursor_valid = true;
 
             break;
         case 'u':
+            if (!plain) {
+                break;
+            }
+
             if (screen.saved_cursor_valid) {
                 screen.pending_wrap = false;
                 screen.cursor = screen.saved_cursor;
@@ -1926,6 +2035,52 @@ handle_sgr__DarkloardParser(void)
 
     for (int i = 0; i < params_len; i++) {
         int p = parser.csi.params[i];
+        // Sub-parameters ("4:3", "38:2::r:g:b") belonging to this one.
+        int sub_start = i + 1;
+        int sub_count = 0;
+
+        while (sub_start + sub_count < params_len &&
+               parser.csi.is_sub[sub_start + sub_count]) {
+            sub_count++;
+        }
+
+        if (sub_count > 0) {
+            const int *sub = &parser.csi.params[sub_start];
+
+            i += sub_count;
+
+            if (p == 4) {
+                // Underline style: 0 = none, anything else = underlined.
+                if (sub[0] == 0) {
+                    screen.current_attrs &= (uint8_t)~DARKLOARD_ATTR_UNDERLINE;
+                } else {
+                    screen.current_attrs |= DARKLOARD_ATTR_UNDERLINE;
+                }
+            } else if (p == 38 || p == 48) {
+                uint32_t color = 0;
+                bool ok = false;
+
+                if (sub[0] == 5 && sub_count >= 2) {
+                    color = xterm256_to_rgb__Darkloard(sub[1]);
+                    ok = true;
+                } else if (sub[0] == 2 && sub_count >= 4) {
+                    // 38:2:r:g:b or 38:2:colorspace:r:g:b
+                    const int *rgb = sub_count >= 5 ? &sub[2] : &sub[1];
+
+                    color = RGB(rgb[0] & 0xFF, rgb[1] & 0xFF, rgb[2] & 0xFF);
+                    ok = true;
+                }
+
+                if (ok && p == 38) {
+                    screen.current_fg = color;
+                } else if (ok) {
+                    screen.current_bg = color;
+                }
+            }
+
+            // Other sub-parameters (e.g. underline color 58:...) are ignored.
+            continue;
+        }
 
         switch (p) {
             case 0:
@@ -2013,9 +2168,9 @@ handle_sgr__DarkloardParser(void)
                     i += 2;
                 } else if (i + 4 < params_len &&
                            parser.csi.params[i + 1] == 2) {
-                    screen.current_fg = RGB(parser.csi.params[i + 2],
-                                            parser.csi.params[i + 3],
-                                            parser.csi.params[i + 4]);
+                    screen.current_fg = RGB(parser.csi.params[i + 2] & 0xFF,
+                                            parser.csi.params[i + 3] & 0xFF,
+                                            parser.csi.params[i + 4] & 0xFF);
                     i += 4;
                 }
 
@@ -2042,15 +2197,26 @@ handle_sgr__DarkloardParser(void)
                     i += 2;
                 } else if (i + 4 < params_len &&
                            parser.csi.params[i + 1] == 2) {
-                    screen.current_bg = RGB(parser.csi.params[i + 2],
-                                            parser.csi.params[i + 3],
-                                            parser.csi.params[i + 4]);
+                    screen.current_bg = RGB(parser.csi.params[i + 2] & 0xFF,
+                                            parser.csi.params[i + 3] & 0xFF,
+                                            parser.csi.params[i + 4] & 0xFF);
                     i += 4;
                 }
 
                 break;
             case 49:
                 screen.current_bg = DARKLOARD_DEFAULT_BG;
+
+                break;
+            case 58:
+                // Underline color: not supported, but skip its arguments so
+                // they aren't taken as SGR codes ("2" would set dim).
+                if (i + 1 < params_len && parser.csi.params[i + 1] == 5) {
+                    i += 2;
+                } else if (i + 1 < params_len &&
+                           parser.csi.params[i + 1] == 2) {
+                    i += 4;
+                }
 
                 break;
             case 90:
@@ -2433,6 +2599,26 @@ init_history__Darkloard(void)
     // push_history_line__Darkloard() checks these slots for NULL.
     memset(history_lines, 0, sizeof(struct DarkloardCell *) * DARKLOARD_HISTORY_LINES);
     memset(history_line_cols, 0, sizeof(uint32_t) * DARKLOARD_HISTORY_LINES);
+}
+
+// Empties the scrollback but keeps it usable (unlike clear_history).
+void
+erase_history__Darkloard(void)
+{
+    for (int i = 0; i < DARKLOARD_HISTORY_LINES; i++) {
+        free(history_lines[i]);
+
+        history_lines[i] = NULL;
+        history_line_cols[i] = 0;
+    }
+
+    history_head = 0;
+    history_count = 0;
+    history_dropped = 0;
+    scroll_offset = 0;
+    // Line numbers changed.
+    selection.active = false;
+    selection.selecting = false;
 }
 
 struct DarkloardCell *
