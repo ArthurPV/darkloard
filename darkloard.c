@@ -360,10 +360,11 @@ static int drag_x = 0;
 static int drag_y = 0;
 static int64_t autoscroll_last_ms = 0;
 
-// Last left click, to detect double-clicks.
+// Last left click, to detect double / triple clicks.
 static Time last_click_time = 0;
 static int64_t last_click_line = -1;
 static uint32_t last_click_col = 0;
+static int click_count = 0;
 #define DARKLOARD_AUTOSCROLL_MS 50
 
 // Mouse reporting (xterm protocol), set by "CSI ? <mode> h/l".
@@ -605,6 +606,9 @@ autoscroll_lines__Darkloard(void);
 
 static bool
 select_word__Darkloard(int64_t line, uint32_t col);
+
+static bool
+select_line__Darkloard(int64_t line);
 
 static void
 autoscroll__Darkloard(void);
@@ -3985,24 +3989,30 @@ handle_button_press__Darkloard(XButtonEvent *event)
 
         pixel_to_selection__Darkloard(event->x, event->y, &line, &col);
 
-        bool double_click = last_click_line == line && last_click_col == col &&
-                            event->time - last_click_time <=
-                              DARKLOARD_DOUBLE_CLICK_MS;
+        bool repeated = last_click_line == line && last_click_col == col &&
+                        event->time - last_click_time <=
+                          DARKLOARD_DOUBLE_CLICK_MS;
 
+        // 1 = normal, 2 = word, 3 = line; a 4th click starts over.
+        click_count = repeated && click_count < 3 ? click_count + 1 : 1;
         last_click_time = event->time;
         last_click_line = line;
         last_click_col = col;
 
-        if (double_click && select_word__Darkloard(line, col)) {
-            // A third click starts a new double-click detection.
-            last_click_line = -1;
-
+        if (click_count == 2 && select_word__Darkloard(line, col)) {
             return;
         }
 
-        deinit__DarkloardSelection();
+        if (click_count == 3 && select_line__Darkloard(line)) {
+            return;
+        }
 
+        // Keep the previous text: we still own PRIMARY, and a click
+        // without dragging shouldn't make it unpasteable. It is replaced
+        // when the new selection is made.
+        selection.active = false;
         selection.selecting = true;
+        screen.is_dirty = true;
 
         pixel_to_selection__Darkloard(
           event->x, event->y, &selection.start_row, &selection.start_col);
@@ -4482,6 +4492,35 @@ select_word__Darkloard(int64_t line, uint32_t col)
     build_selection_text__DarkloardSelection();
 
     // Only spaces: highlighted, but nothing to copy.
+    if (selection.text_len > 0) {
+        XSetSelectionOwner(display, XA_PRIMARY, window, CurrentTime);
+    }
+
+    return true;
+}
+
+// Selects the whole line (triple-click) and makes it the PRIMARY selection.
+bool
+select_line__Darkloard(int64_t line)
+{
+    uint32_t cols = 0;
+
+    if (!get_line_cells__Darkloard(line, &cols) || cols == 0) {
+        return false;
+    }
+
+    deinit__DarkloardSelection();
+
+    selection.start_row = line;
+    selection.start_col = 0;
+    selection.end_row = line;
+    selection.end_col = cols - 1;
+    selection.active = true;
+    screen.is_dirty = true;
+
+    // Trailing spaces are dropped from the text.
+    build_selection_text__DarkloardSelection();
+
     if (selection.text_len > 0) {
         XSetSelectionOwner(display, XA_PRIMARY, window, CurrentTime);
     }
