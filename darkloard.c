@@ -4420,13 +4420,19 @@ poll__Darkloard(void)
             timeout = (int)(DARKLOARD_CURSOR_BLINK_MS - elapsed);
         }
 
+        // Xlib may already have read events into its queue (e.g. during
+        // drawing): the socket then has nothing new and poll() would sleep
+        // with events pending. Don't wait in that case.
+        if (XPending(display) > 0) {
+            timeout = 0;
+        }
+
         int ret = poll(fds, FDS_LEN, timeout);
 
-        if (ret > 0) {
-            if (fds[0].revents & POLLIN) {
-                handle_x_events__Darkloard();
-            }
+        // Handles queued events too, not only when the socket is readable.
+        handle_x_events__Darkloard();
 
+        if (ret > 0) {
             if (fds[1].revents & POLLOUT) {
                 flush_pty__Darkloard();
             }
