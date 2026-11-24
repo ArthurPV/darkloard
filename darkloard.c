@@ -71,6 +71,7 @@
 
 #define LOG_ERROR(fmt, ...) fprintf(stderr, "Error: " fmt "\n", ##__VA_ARGS__);
 #define XMALLOC(size) xmalloc__Darkloard(size)
+#define XREALLOC(ptr, size) xrealloc__Darkloard(ptr, size)
 #define XASPRINTF(buffer, fmt, ...) \
     xasprintf__Darkloard(buffer, fmt, ##__VA_ARGS__);
 
@@ -222,6 +223,13 @@ struct DarkloardParser
     int utf8_remaining;
 };
 
+struct DarkloardBuffer
+{
+    char *data;
+    size_t len;
+    size_t cap;
+};
+
 struct DarkloardSelection
 {
     bool active;
@@ -265,6 +273,12 @@ static int scroll_offset = 0;
 static struct DarkloardScreen screen = { 0 };
 static struct DarkloardParser parser = { 0 };
 static struct DarkloardSelection selection = { 0 };
+// Bytes waiting to be written to the PTY (the master fd is non-blocking, so a
+// large paste can't be written in a single call).
+static struct DarkloardBuffer pty_out = { 0 };
+// Paste being received from another X client (possibly via INCR transfer).
+static struct DarkloardBuffer paste_in = { 0 };
+static bool paste_incr = false;
 static bool running = true;
 static bool app_cursor_keys = false;
 static bool bracketed_paste = false;
@@ -274,6 +288,7 @@ static Atom atom_utf8_string = None;
 static Atom atom_clipboard = None;
 static Atom atom_targets = None;
 static Atom atom_xsel_data = None;
+static Atom atom_incr = None;
 static Atom atom_wm_delete = None;
 static Atom atom_net_wm_name = None;
 
@@ -288,6 +303,17 @@ deinit__DarkloardMessageList(struct DarkloardMessageList *self);
 
 static void *
 xmalloc__Darkloard(size_t size);
+
+static void *
+xrealloc__Darkloard(void *ptr, size_t size);
+
+static void
+append__DarkloardBuffer(struct DarkloardBuffer *self,
+                        const char *data,
+                        size_t data_len);
+
+static void
+flush_pty__Darkloard(void);
 
 static void
 xasprintf__Darkloard(char **buffer, const char *fmt, ...);
@@ -440,6 +466,9 @@ static void
 handle_selection_notify__Darkloard(XSelectionEvent *event);
 
 static void
+handle_property_notify__Darkloard(XPropertyEvent *event);
+
+static void
 handle_button_press__Darkloard(XButtonEvent *event);
 
 static void
@@ -512,6 +541,43 @@ xmalloc__Darkloard(size_t size)
     }
 
     return ptr;
+}
+
+void *
+xrealloc__Darkloard(void *ptr, size_t size)
+{
+    void *new_ptr = realloc(ptr, size);
+
+    if (!new_ptr) {
+        LOG_ERROR("out of memory");
+        exit(1);
+    }
+
+    return new_ptr;
+}
+
+void
+append__DarkloardBuffer(struct DarkloardBuffer *self,
+                        const char *data,
+                        size_t data_len)
+{
+    if (data_len == 0) {
+        return;
+    }
+
+    if (self->len + data_len > self->cap) {
+        size_t new_cap = self->cap ? self->cap : 4096;
+
+        while (new_cap < self->len + data_len) {
+            new_cap *= 2;
+        }
+
+        self->data = XREALLOC(self->data, new_cap);
+        self->cap = new_cap;
+    }
+
+    memcpy(self->data + self->len, data, data_len);
+    self->len += data_len;
 }
 
 void
@@ -758,13 +824,67 @@ read_pty__Darkloard(char **read_buffer_ptr, size_t *nbytes_read)
 int
 write_pty__Darkloard(char *buffer, size_t buffer_len)
 {
-    ssize_t res = write(pty_master_fd, buffer, buffer_len);
+    // Keep ordering: if something is already queued, queue behind it.
+    if (pty_out.len > 0) {
+        append__DarkloardBuffer(&pty_out, buffer, buffer_len);
+        flush_pty__Darkloard();
 
-    if (res == -1) {
-        return 1;
+        return 0;
     }
 
+    while (buffer_len > 0) {
+        ssize_t res = write(pty_master_fd, buffer, buffer_len);
+
+        if (res == -1) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            }
+
+            return 1;
+        }
+
+        buffer += res;
+        buffer_len -= (size_t)res;
+    }
+
+    // The PTY is full: keep the remainder and write it once poll() reports
+    // the fd as writable again.
+    append__DarkloardBuffer(&pty_out, buffer, buffer_len);
+
     return 0;
+}
+
+void
+flush_pty__Darkloard(void)
+{
+    size_t written = 0;
+
+    while (written < pty_out.len) {
+        ssize_t res =
+          write(pty_master_fd, pty_out.data + written, pty_out.len - written);
+
+        if (res == -1) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                // Unrecoverable error: drop pending data.
+                written = pty_out.len;
+            }
+
+            break;
+        }
+
+        written += (size_t)res;
+    }
+
+    memmove(pty_out.data, pty_out.data + written, pty_out.len - written);
+    pty_out.len -= written;
 }
 
 void
@@ -2531,6 +2651,7 @@ init_atoms__Darkloard(void)
     atom_clipboard = XInternAtom(display, "CLIPBOARD", False);
     atom_targets = XInternAtom(display, "TARGETS", False);
     atom_xsel_data = XInternAtom(display, "XSEL_DATA", False);
+    atom_incr = XInternAtom(display, "INCR", False);
     atom_wm_delete = XInternAtom(display, "WM_DELETE_WINDOW", False);
     atom_net_wm_name = XInternAtom(display, "_NET_WM_NAME", False);
 
@@ -2726,6 +2847,72 @@ handle_selection_request__Darkloard(XSelectionRequestEvent *req)
     XSendEvent(req->display, req->requestor, False, 0, (XEvent *)&notify);
 }
 
+// Reads the whole XSEL_DATA property (in chunks, so there is no size cap),
+// appends it to paste_in and deletes the property. Returns the property type.
+static Atom
+read_selection_property__Darkloard(void)
+{
+    Atom actual_type = None;
+    int actual_format = 0;
+    unsigned long nitems = 0, bytes_after = 0;
+    long offset = 0;
+
+    do {
+        unsigned char *data = NULL;
+
+        if (XGetWindowProperty(display,
+                               window,
+                               atom_xsel_data,
+                               offset,
+                               64 * 1024L, // in 32-bit units (256KiB)
+                               False,
+                               AnyPropertyType,
+                               &actual_type,
+                               &actual_format,
+                               &nitems,
+                               &bytes_after,
+                               &data) != Success) {
+            break;
+        }
+
+        if (data && nitems > 0 && actual_format == 8 &&
+            actual_type != atom_incr) {
+            append__DarkloardBuffer(&paste_in, (char *)data, nitems);
+        }
+
+        if (data) {
+            XFree(data);
+        }
+
+        offset += (long)(nitems * (unsigned long)actual_format / 32);
+    } while (bytes_after > 0 && nitems > 0);
+
+    XDeleteProperty(display, window, atom_xsel_data);
+
+    return actual_type;
+}
+
+static void
+finish_paste__Darkloard(void)
+{
+    if (paste_in.len > 0) {
+        if (bracketed_paste) {
+            write_pty__Darkloard("\033[200~", 6);
+        }
+
+        write_pty__Darkloard(paste_in.data, paste_in.len);
+
+        if (bracketed_paste) {
+            write_pty__Darkloard("\033[201~", 6);
+        }
+    }
+
+    free(paste_in.data);
+
+    paste_in = (struct DarkloardBuffer){ 0 };
+    paste_incr = false;
+}
+
 void
 handle_selection_notify__Darkloard(XSelectionEvent *event)
 {
@@ -2733,38 +2920,39 @@ handle_selection_notify__Darkloard(XSelectionEvent *event)
         return;
     }
 
-    Atom actual_type;
-    int actual_format;
-    unsigned long nitems, bytes_after;
-    unsigned char *data = NULL;
+    // A new paste replaces any unfinished INCR transfer.
+    free(paste_in.data);
 
-    XGetWindowProperty(display,
-                       window,
-                       atom_xsel_data,
-                       0,
-                       1024 * 1024L,
-                       True,
-                       AnyPropertyType,
-                       &actual_type,
-                       &actual_format,
-                       &nitems,
-                       &bytes_after,
-                       &data);
+    paste_in = (struct DarkloardBuffer){ 0 };
+    paste_incr = false;
 
-    if (data && nitems > 0) {
-        if (bracketed_paste) {
-            write_pty__Darkloard("\033[200~", 6);
-        }
+    // Large selections are sent with the INCR protocol: the owner gives us an
+    // INCR property, we delete it, then receive the data in chunks through
+    // PropertyNotify events until an empty chunk arrives.
+    if (read_selection_property__Darkloard() == atom_incr) {
+        paste_incr = true;
 
-        write_pty__Darkloard((char *)data, nitems);
-
-        if (bracketed_paste) {
-            write_pty__Darkloard("\033[201~", 6);
-        }
+        return;
     }
 
-    if (data) {
-        XFree(data);
+    finish_paste__Darkloard();
+}
+
+void
+handle_property_notify__Darkloard(XPropertyEvent *event)
+{
+    if (!paste_incr || event->atom != atom_xsel_data ||
+        event->state != PropertyNewValue) {
+        return;
+    }
+
+    size_t prev_len = paste_in.len;
+
+    read_selection_property__Darkloard();
+
+    if (paste_in.len == prev_len) {
+        // Zero-length chunk: end of INCR transfer.
+        finish_paste__Darkloard();
     }
 }
 
@@ -3025,6 +3213,10 @@ handle_x_events__Darkloard(void)
                 handle_selection_notify__Darkloard(&event.xselection);
 
                 break;
+            case PropertyNotify:
+                handle_property_notify__Darkloard(&event.xproperty);
+
+                break;
             case FocusIn:
                 if (focus_events) {
                     write_pty__Darkloard("\033[I", 3);
@@ -3106,11 +3298,17 @@ poll__Darkloard(void)
                                    { .fd = pty_master_fd, .events = POLLIN } };
 
     while (is_terminal_alive__Darkloard() && running) {
+        fds[1].events = POLLIN | (pty_out.len > 0 ? POLLOUT : 0);
+
         int ret = poll(fds, FDS_LEN, -1);
 
         if (ret > 0) {
             if (fds[0].revents & POLLIN) {
                 handle_x_events__Darkloard();
+            }
+
+            if (fds[1].revents & POLLOUT) {
+                flush_pty__Darkloard();
             }
 
             if (fds[1].revents & POLLIN) {
@@ -3284,7 +3482,7 @@ main()
                  window,
                  ExposureMask | KeyPressMask | StructureNotifyMask |
                    ButtonPressMask | ButtonReleaseMask | Button1MotionMask |
-                   FocusChangeMask);
+                   FocusChangeMask | PropertyChangeMask);
     XMapWindow(display, window);
 
     init_atoms__Darkloard();
