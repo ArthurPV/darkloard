@@ -108,7 +108,7 @@
 
 #define DARKLOARD_CSI_MAX_PARAMS 16
 #define DARKLOARD_TAB_WIDTH 8
-#define DARKLOARD_OSC_BUF_SIZE 1024
+#define DARKLOARD_OSC_MAX_SIZE (8 * 1024 * 1024)
 #define DARKLOARD_FONT_CACHE_SIZE 64
 #define DARKLOARD_MAX_READ_BYTES (64 * 1024)
 
@@ -228,8 +228,12 @@ struct DarkloardParser
 {
     enum DarkloardParseState state;
     struct DarkloardCsiParams csi;
-    char osc_buf[DARKLOARD_OSC_BUF_SIZE];
+    // Growable (OSC 52 carries whole clipboard contents), up to
+    // DARKLOARD_OSC_MAX_SIZE; longer sequences are dropped (osc_overflow).
+    char *osc_buf;
     int osc_len;
+    int osc_cap;
+    bool osc_overflow;
     bool osc_esc_pending;
     bool str_esc_pending;
     uint32_t utf8_codepoint;
@@ -311,6 +315,16 @@ static bool running = true;
 static bool app_cursor_keys = false;
 static bool bracketed_paste = false;
 static bool focus_events = false;
+
+// DECSCUSR (CSI Ps SP q). Blinking variants are drawn steady.
+enum DarkloardCursorShape
+{
+    DARKLOARD_CURSOR_BLOCK = 0,
+    DARKLOARD_CURSOR_UNDERLINE,
+    DARKLOARD_CURSOR_BAR,
+};
+
+static enum DarkloardCursorShape cursor_shape = DARKLOARD_CURSOR_BLOCK;
 
 // Mouse reporting (xterm protocol), set by "CSI ? <mode> h/l".
 enum DarkloardMouseMode
@@ -533,6 +547,9 @@ handle_property_notify__Darkloard(XPropertyEvent *event);
 
 static void
 send_osc_color__Darkloard(const char *key, uint32_t color);
+
+static void
+handle_osc52__Darkloard(const char *args);
 
 static void
 update_event_mask__Darkloard(void);
@@ -1596,6 +1613,7 @@ handle_esc__DarkloardParser(unsigned char c)
             break;
         case ']':
             parser.osc_len = 0;
+            parser.osc_overflow = false;
             parser.osc_esc_pending = false;
             parser.state = DARKLOARD_PARSE_STATE_OSC;
 
@@ -1618,6 +1636,7 @@ handle_esc__DarkloardParser(unsigned char c)
             app_cursor_keys = false;
             bracketed_paste = false;
             focus_events = false;
+            cursor_shape = DARKLOARD_CURSOR_BLOCK;
             mouse_mode = DARKLOARD_MOUSE_NONE;
             mouse_sgr = false;
             mouse_urxvt = false;
@@ -2083,6 +2102,16 @@ handle_csi__DarkloardParser(void)
 
             break;
         case 'q':
+            // DECSCUSR: 0-2 block, 3-4 underline, 5-6 bar.
+            if (parser.csi.intermediate == ' ' && !parser.csi.private_mode &&
+                !parser.csi.secondary) {
+                int shape = parser.csi.params_len > 0 ? parser.csi.params[0] : 0;
+
+                cursor_shape = shape >= 5   ? DARKLOARD_CURSOR_BAR
+                               : shape >= 3 ? DARKLOARD_CURSOR_UNDERLINE
+                                            : DARKLOARD_CURSOR_BLOCK;
+            }
+
             break;
         case 'n': {
             int mode = parser.csi.params_len > 0 ? parser.csi.params[0] : 0;
@@ -2508,15 +2537,27 @@ handle_osc_byte__DarkloardParser(unsigned char c)
 
     parser.osc_esc_pending = false;
 
-    if (parser.osc_len < DARKLOARD_OSC_BUF_SIZE - 1) {
-        parser.osc_buf[parser.osc_len++] = (char)c;
+    if (parser.osc_overflow) {
+        return;
     }
+
+    if (parser.osc_len + 1 >= DARKLOARD_OSC_MAX_SIZE) {
+        parser.osc_overflow = true;
+        return;
+    }
+
+    if (parser.osc_len + 1 >= parser.osc_cap) {
+        parser.osc_cap = parser.osc_cap ? parser.osc_cap * 2 : 1024;
+        parser.osc_buf = XREALLOC(parser.osc_buf, (size_t)parser.osc_cap);
+    }
+
+    parser.osc_buf[parser.osc_len++] = (char)c;
 }
 
 void
 handle_osc__DarkloardParser(void)
 {
-    if (parser.osc_len < 1) {
+    if (parser.osc_len < 1 || parser.osc_overflow) {
         return;
     }
 
@@ -2585,6 +2626,10 @@ handle_osc__DarkloardParser(void)
 
                 break;
             }
+            case 52:
+                handle_osc52__Darkloard(parser.osc_buf + i + 1);
+
+                break;
             case 10:
             case 11:
             case 12: {
@@ -2606,6 +2651,111 @@ handle_osc__DarkloardParser(void)
                 break;
         }
     }
+}
+
+// Decodes base64 `in` into a new buffer (whitespace ignored, stops at '=').
+// Returns NULL on invalid input.
+static char *
+base64_decode__Darkloard(const char *in, size_t *out_len)
+{
+    size_t in_len = strlen(in);
+    char *out = XMALLOC(in_len / 4 * 3 + 4);
+    uint32_t acc = 0;
+    int bits = 0;
+    size_t len = 0;
+
+    for (const char *p = in; *p && *p != '='; p++) {
+        int v;
+        char c = *p;
+
+        if (c >= 'A' && c <= 'Z') {
+            v = c - 'A';
+        } else if (c >= 'a' && c <= 'z') {
+            v = c - 'a' + 26;
+        } else if (c >= '0' && c <= '9') {
+            v = c - '0' + 52;
+        } else if (c == '+') {
+            v = 62;
+        } else if (c == '/') {
+            v = 63;
+        } else if (c == ' ' || c == '\n' || c == '\r' || c == '\t') {
+            continue;
+        } else {
+            free(out);
+            return NULL;
+        }
+
+        acc = (acc << 6) | (uint32_t)v;
+        bits += 6;
+
+        if (bits >= 8) {
+            bits -= 8;
+            out[len++] = (char)((acc >> bits) & 0xFF);
+        }
+    }
+
+    *out_len = len;
+
+    return out;
+}
+
+// OSC 52 ; Pc ; Pd: set the clipboard (Pc has 'c' or is empty) and/or the
+// primary selection ('p' or 's') to the base64 data Pd. Used by neovim,
+// tmux, etc. to copy, also over ssh. Reading the clipboard ("?") is
+// deliberately not supported: any program could read it.
+void
+handle_osc52__Darkloard(const char *args)
+{
+    const char *data = strchr(args, ';');
+
+    if (!data) {
+        return;
+    }
+
+    size_t targets_len = (size_t)(data - args);
+    bool to_clipboard = targets_len == 0 || memchr(args, 'c', targets_len);
+    bool to_primary =
+      memchr(args, 'p', targets_len) || memchr(args, 's', targets_len);
+
+    data++;
+
+    if (strcmp(data, "?") == 0) {
+        return;
+    }
+
+    size_t len = 0;
+    char *text = base64_decode__Darkloard(data, &len);
+
+    if (!text) {
+        return;
+    }
+
+    if (len == 0) {
+        free(text);
+        return;
+    }
+
+    if (to_primary) {
+        deinit__DarkloardSelection();
+
+        selection.text = XMALLOC(len);
+        selection.text_len = len;
+
+        memcpy(selection.text, text, len);
+        XSetSelectionOwner(display, XA_PRIMARY, window, CurrentTime);
+    }
+
+    if (to_clipboard) {
+        free(clipboard_text);
+
+        clipboard_text = text;
+        clipboard_text_len = len;
+        text = NULL;
+
+        XSetSelectionOwner(display, atom_clipboard, window, CurrentTime);
+    }
+
+    free(text);
 }
 
 // Replies "OSC key ; rgb:rrrr/gggg/bbbb" with the query's terminator.
@@ -3091,15 +3241,34 @@ draw__Darkloard(void)
         int cy = DARKLOARD_MARGIN_TOP + (int)screen.cursor.row * cell_h;
 
         XSetForeground(display, window_gc, DARKLOARD_CURSOR_COLOR);
-        XFillRectangle(display,
-                       back_buffer,
-                       window_gc,
-                       cx,
-                       cy,
-                       (unsigned int)cell_w,
-                       (unsigned int)cell_h);
 
-        if (screen.cursor.row < screen.rows &&
+        if (cursor_shape == DARKLOARD_CURSOR_UNDERLINE) {
+            int h = cell_h / 10 > 2 ? cell_h / 10 : 2;
+
+            XFillRectangle(display,
+                           back_buffer,
+                           window_gc,
+                           cx,
+                           cy + cell_h - h,
+                           (unsigned int)cell_w,
+                           (unsigned int)h);
+        } else if (cursor_shape == DARKLOARD_CURSOR_BAR) {
+            int w = cell_w / 6 > 2 ? cell_w / 6 : 2;
+
+            XFillRectangle(
+              display, back_buffer, window_gc, cx, cy, (unsigned int)w, (unsigned int)cell_h);
+        } else {
+            XFillRectangle(display,
+                           back_buffer,
+                           window_gc,
+                           cx,
+                           cy,
+                           (unsigned int)cell_w,
+                           (unsigned int)cell_h);
+        }
+
+        if (cursor_shape == DARKLOARD_CURSOR_BLOCK &&
+            screen.cursor.row < screen.rows &&
             screen.cursor.col < screen.cols) {
             struct DarkloardCell *cur_cell =
               &screen.cells[screen.cursor.row][screen.cursor.col];
@@ -4280,6 +4449,7 @@ close__Darkloard(void)
     free(clipboard_text);
     free(pty_out.data);
     free(paste_in.data);
+    free(parser.osc_buf);
 }
 
 int
