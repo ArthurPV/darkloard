@@ -81,6 +81,16 @@
 #define DARKLOARD_CURSOR_BLINK_MS 500
 #endif
 
+#ifndef DARKLOARD_DOUBLE_CLICK_MS
+#define DARKLOARD_DOUBLE_CLICK_MS 400
+#endif
+
+// Characters (besides whitespace) that end a word for double-click
+// selection. Paths, URLs and user@host stay one word.
+#ifndef DARKLOARD_WORD_DELIMITERS
+#define DARKLOARD_WORD_DELIMITERS "'\"()[]{}<>,;|`"
+#endif
+
 #define LOG_ERROR(fmt, ...) fprintf(stderr, "Error: " fmt "\n", ##__VA_ARGS__);
 #define XMALLOC(size) xmalloc__Darkloard(size)
 #define XREALLOC(ptr, size) xrealloc__Darkloard(ptr, size)
@@ -349,6 +359,11 @@ static bool window_focused = true;
 static int drag_x = 0;
 static int drag_y = 0;
 static int64_t autoscroll_last_ms = 0;
+
+// Last left click, to detect double-clicks.
+static Time last_click_time = 0;
+static int64_t last_click_line = -1;
+static uint32_t last_click_col = 0;
 #define DARKLOARD_AUTOSCROLL_MS 50
 
 // Mouse reporting (xterm protocol), set by "CSI ? <mode> h/l".
@@ -587,6 +602,9 @@ clear_selection_highlight__Darkloard(void);
 
 static int
 autoscroll_lines__Darkloard(void);
+
+static bool
+select_word__Darkloard(int64_t line, uint32_t col);
 
 static void
 autoscroll__Darkloard(void);
@@ -3576,8 +3594,9 @@ build_selection_text__DarkloardSelection(void)
                 for (uint32_t c = col_start; c <= last; c++) {
                     uint32_t cp = cells[c].codepoint;
 
+                    // Right half of a wide character: nothing to copy.
                     if (cp == 0) {
-                        cp = ' ';
+                        continue;
                     }
 
                     char utf8[5] = { 0 };
@@ -3961,6 +3980,26 @@ handle_button_press__Darkloard(XButtonEvent *event)
     }
 
     if (event->button == Button1) {
+        int64_t line;
+        uint32_t col;
+
+        pixel_to_selection__Darkloard(event->x, event->y, &line, &col);
+
+        bool double_click = last_click_line == line && last_click_col == col &&
+                            event->time - last_click_time <=
+                              DARKLOARD_DOUBLE_CLICK_MS;
+
+        last_click_time = event->time;
+        last_click_line = line;
+        last_click_col = col;
+
+        if (double_click && select_word__Darkloard(line, col)) {
+            // A third click starts a new double-click detection.
+            last_click_line = -1;
+
+            return;
+        }
+
         deinit__DarkloardSelection();
 
         selection.selecting = true;
@@ -4378,6 +4417,76 @@ handle_pty_events__Darkloard(void)
     }
 
     return is_terminal_alive__Darkloard();
+}
+
+// Character class for word selection: 0 = space, 1 = delimiter, 2 = word.
+static int
+char_class__Darkloard(uint32_t cp)
+{
+    if (cp == ' ' || cp == '\t' || cp == 0x00A0) {
+        return 0;
+    }
+
+    if (cp < 0x80 && cp != 0 && strchr(DARKLOARD_WORD_DELIMITERS, (int)cp)) {
+        return 1;
+    }
+
+    return 2;
+}
+
+// Selects the word (or run of spaces, or single delimiter) at line/col and
+// makes it the PRIMARY selection. Returns false if there is nothing there.
+bool
+select_word__Darkloard(int64_t line, uint32_t col)
+{
+    uint32_t cols = 0;
+    struct DarkloardCell *cells = get_line_cells__Darkloard(line, &cols);
+
+    if (!cells || col >= cols) {
+        return false;
+    }
+
+    // The right half of a wide character belongs to the character before.
+    while (col > 0 && cells[col].codepoint == 0) {
+        col--;
+    }
+
+    int cls = char_class__Darkloard(cells[col].codepoint);
+    uint32_t start = col, end = col;
+
+    if (cls != 1) {
+        while (start > 0 &&
+               (cells[start - 1].codepoint == 0 ||
+                char_class__Darkloard(cells[start - 1].codepoint) == cls)) {
+            start--;
+        }
+
+        while (end + 1 < cols &&
+               (cells[end + 1].codepoint == 0 ||
+                char_class__Darkloard(cells[end + 1].codepoint) == cls)) {
+            end++;
+        }
+    } else if (end + 1 < cols && cells[end + 1].codepoint == 0) {
+        end++;
+    }
+
+    deinit__DarkloardSelection();
+
+    selection.start_row = line;
+    selection.start_col = start;
+    selection.end_row = line;
+    selection.end_col = end;
+    selection.active = true;
+    screen.is_dirty = true;
+
+    build_selection_text__DarkloardSelection();
+
+    // Only spaces: highlighted, but nothing to copy.
+    if (selection.text_len > 0) {
+        XSetSelectionOwner(display, XA_PRIMARY, window, CurrentTime);
+    }
+
+    return true;
 }
 
 // Lines to scroll per step while dragging a selection: negative = towards

@@ -19,6 +19,11 @@
 // CSI Ps SP q), and the blink period.
 #define DARKLOARD_CURSOR_BLINK false
 #define DARKLOARD_CURSOR_BLINK_MS 500
+
+// Double-click selects a word: maximum delay between the clicks, and the
+// characters (besides whitespace) that end a word.
+#define DARKLOARD_DOUBLE_CLICK_MS 400
+#define DARKLOARD_WORD_DELIMITERS "'\"()[]{}<>,;|`"
 #define DARKLOARD_SELECTION_BG RGB(74, 144, 217)
 
 // ANSI color palette (colors 0-15)
