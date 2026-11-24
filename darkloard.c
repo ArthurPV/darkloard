@@ -1027,39 +1027,122 @@ deinit__DarkloardScreen(void)
     clear_history__Darkloard();
 }
 
-void
-resize__DarkloardScreen(uint32_t rows, uint32_t cols)
+// Returns a rows x cols copy of `old` (old_rows x old_cols), starting at
+// old row `skip`: content is kept at the top-left, cropped or padded with
+// blanks. Frees `old`.
+static struct DarkloardCell **
+resize_cells__DarkloardScreen(struct DarkloardCell **old,
+                              uint32_t old_rows,
+                              uint32_t old_cols,
+                              uint32_t skip,
+                              uint32_t rows,
+                              uint32_t cols)
 {
-    // init__DarkloardScreen() resets in_alt_screen, so remember it here.
-    bool was_alt_screen = in_alt_screen;
+    struct DarkloardCell blank = { .codepoint = ' ',
+                                   .fg = DARKLOARD_DEFAULT_FG,
+                                   .bg = DARKLOARD_DEFAULT_BG,
+                                   .attrs = 0 };
+    struct DarkloardCell **cells = XMALLOC(rows * sizeof(struct DarkloardCell *));
 
-    scroll_offset = 0;
-    // Line numbers shift when the screen is pushed to history.
-    selection.active = false;
-    selection.selecting = false;
+    for (uint32_t i = 0; i < rows; i++) {
+        cells[i] = XMALLOC(cols * sizeof(struct DarkloardCell));
 
-    if (!was_alt_screen && screen.cells) {
-        // Only keep rows up to the cursor: the rest are blank and would just
-        // fill the scrollback with empty lines on every resize.
-        uint32_t last_row =
-          screen.cursor.row < screen.rows ? screen.cursor.row : screen.rows - 1;
+        uint32_t src = i + skip;
+        uint32_t copied = 0;
 
-        for (uint32_t i = 0; i <= last_row; i++) {
-            push_history_line__Darkloard(screen.cells[i], screen.cols);
+        if (src < old_rows) {
+            copied = old_cols < cols ? old_cols : cols;
+
+            memcpy(cells[i], old[src], copied * sizeof(struct DarkloardCell));
+        }
+
+        for (uint32_t j = copied; j < cols; j++) {
+            cells[i][j] = blank;
         }
     }
 
-    free_cells__DarkloardScreen();
-    init__DarkloardScreen(rows, cols);
-
-    if (was_alt_screen) {
-        struct DarkloardCell **tmp = screen.cells;
-        screen.cells = inactive_cells;
-        inactive_cells = tmp;
-        in_alt_screen = true;
-        screen.cursor.row = 0;
-        screen.cursor.col = 0;
+    for (uint32_t i = 0; i < old_rows; i++) {
+        free(old[i]);
     }
+
+    free(old);
+
+    return cells;
+}
+
+static void
+clamp_cursor__DarkloardScreen(struct DarkloardCursor *cursor,
+                              uint32_t rows,
+                              uint32_t cols)
+{
+    if (cursor->row >= rows) {
+        cursor->row = rows - 1;
+    }
+
+    if (cursor->col >= cols) {
+        cursor->col = cols - 1;
+    }
+}
+
+void
+resize__DarkloardScreen(uint32_t rows, uint32_t cols)
+{
+    if (!screen.cells) {
+        init__DarkloardScreen(rows, cols);
+
+        return;
+    }
+
+    if (rows == screen.rows && cols == screen.cols) {
+        return;
+    }
+
+    scroll_offset = 0;
+    // Line numbers may shift when lines move to history.
+    selection.active = false;
+    selection.selecting = false;
+
+    struct DarkloardCell ***main_cells =
+      in_alt_screen ? &inactive_cells : &screen.cells;
+    struct DarkloardCell ***alt_cells =
+      in_alt_screen ? &screen.cells : &inactive_cells;
+    struct DarkloardCursor *main_cursor =
+      in_alt_screen ? &main_cursor_saved : &screen.cursor;
+
+    // Main screen: keep its content. If it gets shorter than the cursor
+    // position, move the top lines to the scrollback so the cursor line stays
+    // visible (instead of losing the shell's output).
+    uint32_t skip = 0;
+
+    if (main_cursor->row >= rows) {
+        skip = main_cursor->row - rows + 1;
+
+        for (uint32_t i = 0; i < skip; i++) {
+            push_history_line__Darkloard((*main_cells)[i], screen.cols);
+        }
+
+        main_cursor->row -= skip;
+    }
+
+    *main_cells = resize_cells__DarkloardScreen(
+      *main_cells, screen.rows, screen.cols, skip, rows, cols);
+
+    // Alternate screen: the application redraws it on SIGWINCH, just keep
+    // what fits meanwhile.
+    *alt_cells = resize_cells__DarkloardScreen(
+      *alt_cells, screen.rows, screen.cols, 0, rows, cols);
+
+    screen.rows = rows;
+    screen.cols = cols;
+    screen.scroll_region.top = 0;
+    screen.scroll_region.bottom = rows - 1;
+    screen.pending_wrap = false;
+
+    clamp_cursor__DarkloardScreen(&screen.cursor, rows, cols);
+    clamp_cursor__DarkloardScreen(&main_cursor_saved, rows, cols);
+    clamp_cursor__DarkloardScreen(&screen.saved_cursor, rows, cols);
+
+    screen.is_dirty = true;
 }
 
 void
