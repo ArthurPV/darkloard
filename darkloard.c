@@ -226,6 +226,7 @@ enum DarkloardParseState
     DARKLOARD_PARSE_STATE_OSC,
     DARKLOARD_PARSE_STATE_CHARSET,
     DARKLOARD_PARSE_STATE_STR_SKIP,
+    DARKLOARD_PARSE_STATE_DCS,
 };
 
 struct DarkloardCsiParams
@@ -256,6 +257,11 @@ struct DarkloardParser
     bool osc_overflow;
     bool osc_esc_pending;
     bool str_esc_pending;
+    // DCS string being collected (queries only, so a small buffer is
+    // enough; longer strings are dropped).
+    char dcs_buf[512];
+    int dcs_len;
+    bool dcs_overflow;
     uint32_t utf8_codepoint;
     int utf8_remaining;
     // Which G set "ESC ( x" / "ESC ) x" designates.
@@ -361,6 +367,8 @@ enum DarkloardCursorShape
 };
 
 static enum DarkloardCursorShape cursor_shape = DARKLOARD_CURSOR_BLOCK;
+// Last DECSCUSR parameter, reported by DECRQSS.
+static int cursor_shape_param = 0;
 // Blinking (DECSCUSR odd shapes, or mode ?12). cursor_blink_on is the
 // current phase; blinking pauses while the window is unfocused.
 static bool cursor_blink = DARKLOARD_CURSOR_BLINK;
@@ -561,6 +569,12 @@ save_cursor__Darkloard(void);
 
 static void
 init_input_method__Darkloard(void);
+
+static void
+handle_dcs_byte__DarkloardParser(unsigned char c);
+
+static void
+handle_dcs__DarkloardParser(void);
 
 static void
 restore_cursor__Darkloard(void);
@@ -1747,6 +1761,7 @@ handle_esc__DarkloardParser(unsigned char c)
             bracketed_paste = false;
             focus_events = false;
             cursor_shape = DARKLOARD_CURSOR_BLOCK;
+            cursor_shape_param = 0;
             cursor_blink = DARKLOARD_CURSOR_BLINK;
             sync_output = false;
             mouse_mode = DARKLOARD_MOUSE_NONE;
@@ -1802,6 +1817,12 @@ handle_esc__DarkloardParser(unsigned char c)
 
             break;
         case 'P':
+            parser.dcs_len = 0;
+            parser.dcs_overflow = false;
+            parser.str_esc_pending = false;
+            parser.state = DARKLOARD_PARSE_STATE_DCS;
+
+            break;
         case '_':
         case '^':
         case 'X':
@@ -2248,7 +2269,12 @@ handle_csi__DarkloardParser(void)
                 cursor_blink =
                   shape == 0 ? DARKLOARD_CURSOR_BLINK : (shape % 2 == 1);
 
+                cursor_shape_param = shape;
+
                 reset_cursor_blink__Darkloard();
+            } else if (parser.csi.secondary && parser.csi.intermediate == 0) {
+                // XTVERSION (CSI > q): terminal name and version.
+                write_pty__Darkloard("\033P>|darkloard\033\\", 15);
             }
 
             break;
@@ -2256,13 +2282,54 @@ handle_csi__DarkloardParser(void)
             int mode = parser.csi.params_len > 0 ? parser.csi.params[0] : 0;
 
             if (mode == 6) {
+                // CPR / DECXCPR (with '?'): cursor position.
                 char response[32];
                 int len = snprintf(response,
                                    sizeof(response),
-                                   "\033[%u;%uR",
+                                   "\033[%s%u;%uR",
+                                   parser.csi.private_mode ? "?" : "",
                                    screen.cursor.row + 1,
                                    screen.cursor.col + 1);
 
+                write_pty__Darkloard(response, (size_t)len);
+            } else if (mode == 5 && !parser.csi.private_mode) {
+                // Device status: OK.
+                write_pty__Darkloard("\033[0n", 4);
+            }
+
+            break;
+        }
+        case 't': {
+            // XTWINOPS size reports (other window operations are ignored).
+            if (!plain || !fonts[FONT_REGULAR]) {
+                break;
+            }
+
+            int op = parser.csi.params_len > 0 ? parser.csi.params[0] : 0;
+            int cell_w = fonts[FONT_REGULAR]->max_advance_width;
+            int cell_h =
+              fonts[FONT_REGULAR]->ascent + fonts[FONT_REGULAR]->descent;
+            char response[48];
+            int len = 0;
+
+            if (op == 14) { // text area in pixels
+                len = snprintf(response,
+                               sizeof(response),
+                               "\033[4;%u;%ut",
+                               screen.rows * (uint32_t)cell_h,
+                               screen.cols * (uint32_t)cell_w);
+            } else if (op == 16) { // cell size in pixels
+                len = snprintf(
+                  response, sizeof(response), "\033[6;%d;%dt", cell_h, cell_w);
+            } else if (op == 18) { // text area in characters
+                len = snprintf(response,
+                               sizeof(response),
+                               "\033[8;%u;%ut",
+                               screen.rows,
+                               screen.cols);
+            }
+
+            if (len > 0) {
                 write_pty__Darkloard(response, (size_t)len);
             }
 
@@ -2937,6 +3004,233 @@ send_osc_color__Darkloard(const char *key, uint32_t color)
 }
 
 void
+handle_dcs_byte__DarkloardParser(unsigned char c)
+{
+    if (parser.str_esc_pending) {
+        parser.str_esc_pending = false;
+
+        if (c == '\\') {
+            // ST: end of the string.
+            parser.state = DARKLOARD_PARSE_STATE_NORMAL;
+
+            if (!parser.dcs_overflow) {
+                parser.dcs_buf[parser.dcs_len] = '\0';
+                handle_dcs__DarkloardParser();
+            }
+
+            return;
+        }
+
+        // Another escape sequence: the DCS is aborted.
+        parser.state = DARKLOARD_PARSE_STATE_ESC;
+        handle_esc__DarkloardParser(c);
+
+        return;
+    }
+
+    if (c == DARKLOARD_ESC) {
+        parser.str_esc_pending = true;
+        return;
+    }
+
+    if (c == DARKLOARD_CAN || c == DARKLOARD_SUB) {
+        parser.state = DARKLOARD_PARSE_STATE_NORMAL;
+        return;
+    }
+
+    if (parser.dcs_len + 1 >= (int)sizeof(parser.dcs_buf)) {
+        parser.dcs_overflow = true;
+        return;
+    }
+
+    parser.dcs_buf[parser.dcs_len++] = (char)c;
+}
+
+// XTGETTCAP capabilities we answer (terminfo names: xterm-256color plus
+// what darkloard supports). Values are raw strings.
+static const char *
+lookup_tcap__Darkloard(const char *name)
+{
+    static const char *caps[][2] = {
+        { "TN", "xterm-256color" },
+        { "name", "xterm-256color" },
+        { "Co", "256" },
+        { "colors", "256" },
+        { "RGB", "8/8/8" },
+        { "Tc", "" },
+        { "Ms", "\033]52;%p1%s;%p2%s\a" },
+        { "Ss", "\033[%p1%d q" },
+        { "Se", "\033[2 q" },
+        { "kbs", "\177" },
+        { "kdch1", "\033[3~" },
+    };
+
+    for (size_t i = 0; i < sizeof(caps) / sizeof(caps[0]); i++) {
+        if (strcmp(caps[i][0], name) == 0) {
+            return caps[i][1];
+        }
+    }
+
+    return NULL;
+}
+
+static int
+hex_value__Darkloard(char c)
+{
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+
+    return -1;
+}
+
+static void
+append_hex__Darkloard(struct DarkloardBuffer *out, const char *str)
+{
+    static const char digits[] = "0123456789ABCDEF";
+
+    for (const unsigned char *p = (const unsigned char *)str; *p; p++) {
+        char hex[2] = { digits[*p >> 4], digits[*p & 0xF] };
+
+        append__DarkloardBuffer(out, hex, 2);
+    }
+}
+
+// XTGETTCAP: "DCS + q <hex name>;<hex name>... ST". Replies, for each name,
+// "DCS 1 + r <hex name>=<hex value> ST" or "DCS 0 + r <hex name> ST".
+static void
+handle_xtgettcap__Darkloard(const char *names)
+{
+    const char *p = names;
+
+    while (*p) {
+        const char *end = strchr(p, ';');
+        size_t hex_len = end ? (size_t)(end - p) : strlen(p);
+        char name[64];
+        size_t name_len = 0;
+        bool valid = hex_len % 2 == 0 && hex_len / 2 < sizeof(name);
+
+        for (size_t i = 0; valid && i < hex_len; i += 2) {
+            int hi = hex_value__Darkloard(p[i]);
+            int lo = hex_value__Darkloard(p[i + 1]);
+
+            if (hi < 0 || lo < 0) {
+                valid = false;
+                break;
+            }
+
+            name[name_len++] = (char)(hi * 16 + lo);
+        }
+
+        name[name_len] = '\0';
+
+        const char *value = valid ? lookup_tcap__Darkloard(name) : NULL;
+        struct DarkloardBuffer out = { 0 };
+
+        append__DarkloardBuffer(&out, value ? "\033P1+r" : "\033P0+r", 5);
+        append__DarkloardBuffer(&out, p, hex_len);
+
+        if (value) {
+            append__DarkloardBuffer(&out, "=", 1);
+            append_hex__Darkloard(&out, value);
+        }
+
+        append__DarkloardBuffer(&out, "\033\\", 2);
+        write_pty__Darkloard(out.data, out.len);
+        free(out.data);
+
+        p = end ? end + 1 : p + hex_len;
+    }
+}
+
+// DECRQSS: "DCS $ q <setting> ST". Replies "DCS 1 $ r <value><setting> ST",
+// or "DCS 0 $ r ST" for unsupported settings.
+static void
+handle_decrqss__Darkloard(const char *setting)
+{
+    char value[160];
+    int len = -1;
+
+    if (strcmp(setting, "m") == 0) {
+        // Current SGR (colors as RGB: palette indexes aren't kept).
+        uint8_t a = screen.current_attrs;
+
+        len = snprintf(value,
+                       sizeof(value),
+                       "0%s%s%s%s%s%s%s%s",
+                       (a & DARKLOARD_ATTR_BOLD) ? ";1" : "",
+                       (a & DARKLOARD_ATTR_DIM) ? ";2" : "",
+                       (a & DARKLOARD_ATTR_ITALIC) ? ";3" : "",
+                       (a & DARKLOARD_ATTR_UNDERLINE) ? ";4" : "",
+                       (a & DARKLOARD_ATTR_BLINK) ? ";5" : "",
+                       (a & DARKLOARD_ATTR_REVERSE) ? ";7" : "",
+                       (a & DARKLOARD_ATTR_INVISIBLE) ? ";8" : "",
+                       (a & DARKLOARD_ATTR_STRIKE) ? ";9" : "");
+
+        if (screen.current_fg != DARKLOARD_DEFAULT_FG) {
+            uint32_t c = screen.current_fg;
+
+            len += snprintf(value + len,
+                            sizeof(value) - (size_t)len,
+                            ";38;2;%u;%u;%u",
+                            (c >> 16) & 0xFF,
+                            (c >> 8) & 0xFF,
+                            c & 0xFF);
+        }
+
+        if (screen.current_bg != DARKLOARD_DEFAULT_BG) {
+            uint32_t c = screen.current_bg;
+
+            len += snprintf(value + len,
+                            sizeof(value) - (size_t)len,
+                            ";48;2;%u;%u;%u",
+                            (c >> 16) & 0xFF,
+                            (c >> 8) & 0xFF,
+                            c & 0xFF);
+        }
+    } else if (strcmp(setting, "r") == 0) {
+        len = snprintf(value,
+                       sizeof(value),
+                       "%u;%u",
+                       screen.scroll_region.top + 1,
+                       screen.scroll_region.bottom + 1);
+    } else if (strcmp(setting, " q") == 0) {
+        len = snprintf(value, sizeof(value), "%d", cursor_shape_param);
+    }
+
+    char reply[200];
+    int reply_len = len < 0
+                      ? snprintf(reply, sizeof(reply), "\033P0$r\033\\")
+                      : snprintf(reply,
+                                 sizeof(reply),
+                                 "\033P1$r%s%s\033\\",
+                                 value,
+                                 setting);
+
+    write_pty__Darkloard(reply, (size_t)reply_len);
+}
+
+void
+handle_dcs__DarkloardParser(void)
+{
+    if (strncmp(parser.dcs_buf, "+q", 2) == 0) {
+        handle_xtgettcap__Darkloard(parser.dcs_buf + 2);
+    } else if (strncmp(parser.dcs_buf, "$q", 2) == 0) {
+        handle_decrqss__Darkloard(parser.dcs_buf + 2);
+    }
+
+    // Other DCS strings (sixel, DECUDK, tmux passthrough...) are ignored.
+}
+
+void
 handle_str_skip__DarkloardParser(unsigned char c)
 {
     if (c == DARKLOARD_ESC) {
@@ -3026,6 +3320,10 @@ feed__DarkloardParser(unsigned char c)
             // Only DEC special graphics is special, anything else is ASCII.
             screen.charsets[parser.charset_target] = (c == '0') ? '0' : 'B';
             parser.state = DARKLOARD_PARSE_STATE_NORMAL;
+
+            break;
+        case DARKLOARD_PARSE_STATE_DCS:
+            handle_dcs_byte__DarkloardParser(c);
 
             break;
         case DARKLOARD_PARSE_STATE_STR_SKIP:
