@@ -576,6 +576,9 @@ static void
 reset_cursor_blink__Darkloard(void);
 
 static void
+clear_selection_highlight__Darkloard(void);
+
+static void
 update_event_mask__Darkloard(void);
 
 static bool
@@ -3955,6 +3958,7 @@ handle_button_press__Darkloard(XButtonEvent *event)
         selection.end_row = selection.start_row;
         selection.end_col = selection.start_col;
     } else if (event->button == Button2) {
+        clear_selection_highlight__Darkloard();
         request_paste__Darkloard(XA_PRIMARY);
     } else if (event->button == Button4) {
         if (in_alt_screen) {
@@ -4102,6 +4106,8 @@ handle_keypress__Darkloard(XKeyEvent *event)
             case XK_V:
                 scroll_offset = 0;
 
+                clear_selection_highlight__Darkloard();
+
                 request_paste__Darkloard(atom_clipboard);
 
                 return;
@@ -4146,6 +4152,7 @@ handle_keypress__Darkloard(XKeyEvent *event)
     scroll_offset = 0;
 
     reset_cursor_blink__Darkloard();
+    clear_selection_highlight__Darkloard();
 
     if (len > 0) {
         write_pty__Darkloard(buf, (size_t)len);
@@ -4356,6 +4363,17 @@ now_ms__Darkloard(void)
     clock_gettime(CLOCK_MONOTONIC, &ts);
 
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+// Removes the selection highlight when the user sends input. The selected
+// text is kept, so it can still be pasted with the middle button.
+void
+clear_selection_highlight__Darkloard(void)
+{
+    if (selection.active && !selection.selecting) {
+        selection.active = false;
+        screen.is_dirty = true;
+    }
 }
 
 // Show the cursor and restart the blink period (on input / output, so the
