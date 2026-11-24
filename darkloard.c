@@ -201,6 +201,8 @@ struct DarkloardScreen
     bool pending_wrap;
     bool auto_wrap;
     bool insert_mode; // IRM (CSI 4 h)
+    // Tab stops, one flag per column (set with ESC H, cleared with CSI g).
+    bool *tabs;
     // Character sets G0/G1 ('B' = ASCII, '0' = DEC special graphics) and
     // which one is active (SO selects G1, SI selects G0).
     char charsets[2];
@@ -569,6 +571,15 @@ save_cursor__Darkloard(void);
 
 static void
 init_input_method__Darkloard(void);
+
+static void
+resize_tabs__DarkloardScreen(uint32_t old_cols, uint32_t cols);
+
+static void
+next_tab__DarkloardScreen(void);
+
+static void
+prev_tab__DarkloardScreen(void);
 
 static void
 handle_dcs_byte__DarkloardParser(unsigned char c);
@@ -1124,6 +1135,10 @@ init__DarkloardScreen(uint32_t rows, uint32_t cols)
     screen.charsets[1] = 'B';
     screen.active_charset = 0;
     screen.last_char = ' ';
+
+    free(screen.tabs);
+    screen.tabs = NULL;
+    resize_tabs__DarkloardScreen(0, cols);
     screen.cells = XMALLOC(rows * sizeof(struct DarkloardCell *));
 
     for (uint32_t i = 0; i < rows; i++) {
@@ -1290,6 +1305,8 @@ resize__DarkloardScreen(uint32_t rows, uint32_t cols)
     *alt_cells = resize_cells__DarkloardScreen(
       *alt_cells, screen.rows, screen.cols, 0, rows, cols);
 
+    resize_tabs__DarkloardScreen(screen.cols, cols);
+
     screen.rows = rows;
     screen.cols = cols;
     screen.scroll_region.top = 0;
@@ -1412,6 +1429,48 @@ scroll_down__DarkloardScreen(uint32_t top, uint32_t bottom, uint32_t n)
                                       .attrs = 0 };
         }
     }
+}
+
+// Resizes the tab stops, keeping existing ones; new columns get the
+// default stops (every DARKLOARD_TAB_WIDTH columns).
+void
+resize_tabs__DarkloardScreen(uint32_t old_cols, uint32_t cols)
+{
+    screen.tabs = XREALLOC(screen.tabs, cols * sizeof(bool));
+
+    for (uint32_t c = old_cols; c < cols; c++) {
+        screen.tabs[c] = c > 0 && c % DARKLOARD_TAB_WIDTH == 0;
+    }
+}
+
+// Moves to the next tab stop, or the last column if there is none.
+void
+next_tab__DarkloardScreen(void)
+{
+    uint32_t col = screen.cursor.col + 1;
+
+    while (col < screen.cols && !screen.tabs[col]) {
+        col++;
+    }
+
+    screen.cursor.col = col < screen.cols ? col : screen.cols - 1;
+}
+
+// Moves to the previous tab stop, or the first column if there is none.
+void
+prev_tab__DarkloardScreen(void)
+{
+    uint32_t col = screen.cursor.col;
+
+    while (col > 0) {
+        col--;
+
+        if (screen.tabs[col]) {
+            break;
+        }
+    }
+
+    screen.cursor.col = col;
 }
 
 void
@@ -1643,18 +1702,10 @@ handle_normal__DarkloardParser(unsigned char c)
             }
 
             break;
-        case DARKLOARD_HT: {
-            uint32_t next_tab = (screen.cursor.col / DARKLOARD_TAB_WIDTH + 1) *
-                                DARKLOARD_TAB_WIDTH;
-
-            if (next_tab >= screen.cols) {
-                next_tab = screen.cols - 1;
-            }
-
-            screen.cursor.col = next_tab;
+        case DARKLOARD_HT:
+            next_tab__DarkloardScreen();
 
             break;
-        }
         case DARKLOARD_LF:
         case DARKLOARD_VT:
         case DARKLOARD_FF:
@@ -1779,6 +1830,7 @@ handle_esc__DarkloardParser(unsigned char c)
             screen.charsets[0] = 'B';
             screen.charsets[1] = 'B';
             screen.active_charset = 0;
+            resize_tabs__DarkloardScreen(0, screen.cols);
             screen.cursor.row = 0;
             screen.cursor.col = 0;
             screen.current_fg = DARKLOARD_DEFAULT_FG;
@@ -1809,6 +1861,9 @@ handle_esc__DarkloardParser(unsigned char c)
 
             break;
         case 'H':
+            // HTS: tab stop at the cursor column.
+            screen.tabs[screen.cursor.col] = true;
+
             break;
         case '(':
         case ')':
@@ -1955,6 +2010,7 @@ handle_csi__DarkloardParser(void)
 
             break;
         }
+        case 'e': // VPR, same as CUD
         case 'B': {
             int n = CSI_PARAM(0, 1);
             int new_row = (int)screen.cursor.row + n;
@@ -1969,6 +2025,7 @@ handle_csi__DarkloardParser(void)
 
             break;
         }
+        case 'a': // HPR, same as CUF
         case 'C': {
             int n = CSI_PARAM(0, 1);
             int new_col = (int)screen.cursor.col + n;
@@ -2018,6 +2075,7 @@ handle_csi__DarkloardParser(void)
 
             break;
         }
+        case '`': // HPA, same as CHA
         case 'G': {
             int col = CSI_PARAM(0, 1) - 1;
 
@@ -2164,38 +2222,47 @@ handle_csi__DarkloardParser(void)
 
             break;
         }
-        case 'I': {
+        case 'I': { // CHT: forward n tab stops
             int n = CSI_PARAM(0, 1);
 
-            for (int j = 0; j < n; j++) {
-                uint32_t next_tab =
-                  (screen.cursor.col / DARKLOARD_TAB_WIDTH + 1) *
-                  DARKLOARD_TAB_WIDTH;
-                screen.cursor.col =
-                  next_tab >= screen.cols ? screen.cols - 1 : next_tab;
+            screen.pending_wrap = false;
 
-                if (next_tab >= screen.cols) {
-                    break;
-                }
+            for (int j = 0; j < n && screen.cursor.col < screen.cols - 1; j++) {
+                next_tab__DarkloardScreen();
             }
 
             break;
         }
-        case 'Z': {
+        case 'Z': { // CBT: back n tab stops
             int n = CSI_PARAM(0, 1);
 
-            for (int j = 0; j < n; j++) {
-                if (screen.cursor.col == 0) {
-                    break;
-                }
+            screen.pending_wrap = false;
 
-                uint32_t prev_tab = (screen.cursor.col - 1) /
-                                    DARKLOARD_TAB_WIDTH * DARKLOARD_TAB_WIDTH;
-                screen.cursor.col = prev_tab;
+            for (int j = 0; j < n && screen.cursor.col > 0; j++) {
+                prev_tab__DarkloardScreen();
             }
 
             break;
         }
+        case 'g': // TBC: 0 = clear the stop at the cursor, 3 = clear all
+            if (plain) {
+                int mode = parser.csi.params_len > 0 ? parser.csi.params[0] : 0;
+
+                if (mode == 0) {
+                    screen.tabs[screen.cursor.col] = false;
+                } else if (mode == 3) {
+                    memset(screen.tabs, 0, screen.cols * sizeof(bool));
+                }
+            }
+
+            break;
+        case 'W': // DECST8C (CSI ? 5 W): tab stops every 8 columns
+            if (parser.csi.private_mode && parser.csi.params_len > 0 &&
+                parser.csi.params[0] == 5) {
+                resize_tabs__DarkloardScreen(0, screen.cols);
+            }
+
+            break;
         case 'p':
             // DECRQM: "CSI ? Ps $ p" / "CSI Ps $ p" ask whether a mode is
             // supported and set. Applications use it to detect features
@@ -5413,6 +5480,7 @@ close__Darkloard(void)
     free(pty_out.data);
     free(paste_in.data);
     free(parser.osc_buf);
+    free(screen.tabs);
 }
 
 int
