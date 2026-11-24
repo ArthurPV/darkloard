@@ -279,6 +279,11 @@ static struct DarkloardBuffer pty_out = { 0 };
 // Paste being received from another X client (possibly via INCR transfer).
 static struct DarkloardBuffer paste_in = { 0 };
 static bool paste_incr = false;
+// Text owned as CLIPBOARD (Ctrl+Shift+C). Kept separate from the PRIMARY
+// selection so a new mouse selection or losing one selection doesn't affect
+// the other.
+static char *clipboard_text = NULL;
+static size_t clipboard_text_len = 0;
 static bool running = true;
 static bool app_cursor_keys = false;
 static bool bracketed_paste = false;
@@ -2814,7 +2819,15 @@ handle_selection_request__Darkloard(XSelectionRequestEvent *req)
         .time = req->time,
     };
 
-    if (!selection.text || selection.text_len == 0) {
+    const char *text = selection.text;
+    size_t text_len = selection.text_len;
+
+    if (req->selection == atom_clipboard) {
+        text = clipboard_text;
+        text_len = clipboard_text_len;
+    }
+
+    if (!text || text_len == 0) {
         XSendEvent(req->display, req->requestor, False, 0, (XEvent *)&notify);
         return;
     }
@@ -2838,8 +2851,8 @@ handle_selection_request__Darkloard(XSelectionRequestEvent *req)
                         req->target,
                         8,
                         PropModeReplace,
-                        (unsigned char *)selection.text,
-                        (int)selection.text_len);
+                        (unsigned char *)text,
+                        (int)text_len);
 
         notify.property = req->property;
     }
@@ -2897,6 +2910,19 @@ finish_paste__Darkloard(void)
 {
     if (paste_in.len > 0) {
         if (bracketed_paste) {
+            // Drop ESC bytes so the pasted text can't contain its own
+            // "\033[201~" terminator and escape bracketed paste: otherwise
+            // copied text could inject commands that the shell runs.
+            size_t out = 0;
+
+            for (size_t i = 0; i < paste_in.len; i++) {
+                if (paste_in.data[i] != '\033') {
+                    paste_in.data[out++] = paste_in.data[i];
+                }
+            }
+
+            paste_in.len = out;
+
             write_pty__Darkloard("\033[200~", 6);
         }
 
@@ -3069,6 +3095,12 @@ handle_keypress__Darkloard(XKeyEvent *event)
             case XK_c:
             case XK_C:
                 if (selection.active && selection.text_len > 0) {
+                    free(clipboard_text);
+
+                    clipboard_text = XMALLOC(selection.text_len);
+                    clipboard_text_len = selection.text_len;
+
+                    memcpy(clipboard_text, selection.text, selection.text_len);
                     XSetSelectionOwner(
                       display, atom_clipboard, window, CurrentTime);
                 }
@@ -3230,7 +3262,14 @@ handle_x_events__Darkloard(void)
 
                 break;
             case SelectionClear:
-                deinit__DarkloardSelection();
+                if (event.xselectionclear.selection == atom_clipboard) {
+                    free(clipboard_text);
+
+                    clipboard_text = NULL;
+                    clipboard_text_len = 0;
+                } else {
+                    deinit__DarkloardSelection();
+                }
 
                 break;
             case ConfigureNotify: {
@@ -3243,8 +3282,6 @@ handle_x_events__Darkloard(void)
                 break;
             }
             default:
-                screen.is_dirty = false;
-
                 break;
         }
     }
@@ -3437,6 +3474,9 @@ close__Darkloard(void)
     deinit__DarkloardMessageList(&message_list);
     deinit__DarkloardScreen();
     deinit__DarkloardSelection();
+    free(clipboard_text);
+    free(pty_out.data);
+    free(paste_in.data);
 }
 
 int
